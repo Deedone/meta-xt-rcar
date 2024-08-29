@@ -6,14 +6,17 @@ SRCREV:r8a779f0 = "769ab722739878c3c1aaa1571f6ca996b135f8f6"
 
 SRC_URI:append = "\
     file://defconfig \
-"
-
-SRC_URI:append = " \
-    file://r8a779f0.cfg \
     file://rswitch.cfg \
     file://dmatest.cfg \
     file://gpio.cfg \
     file://l3offload.cfg \
+"
+
+SRC_URI:append:r8a779f0 = " \
+    file://r8a779f0.cfg \
+"
+SRC_URI:append:r8a779g0 = " \
+    file://r8a779g0.cfg \
 "
 
 ADDITIONAL_DEVICE_TREES = "${XT_DEVICE_TREES}"

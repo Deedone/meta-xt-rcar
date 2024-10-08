@@ -1,13 +1,8 @@
-# It actually provides libgles3, but Renesas recipe omits this for
-# some reason. We need this for kmscube at least
-PROVIDES += "virtual/libgles3"
+FILESEXTRAPATHS:prepend := "${TOPDIR}/../..:"
+SRC_URI = "file://r8a779g0_linux_gsx_binaries_gles_vz_DDK23.3_v2.tar.bz2"
+SRC_URI:r8a779g0 = "file://r8a779g0_linux_gsx_binaries_gles_vz_DDK23.3_v2.tar.bz2"
+S = "${WORKDIR}/rogue"
 
-python () {
-    if d.getVar('XT_PREBUILT_GSX_DIR', True):
-        # We use prebuilt package provided by user
-        d.appendVar('FILESEXTRAPATHS', '${XT_PREBUILT_GSX_DIR}/${XT_DOM_NAME}:')
-    else:
-        # We prepare package by gles-um-compile
-        d.appendVar('FILESEXTRAPATHS', '${DEPLOY_DIR_IMAGE}/prebuilt/${XT_DOM_NAME}:')
-        d.appendVarFlag('do_fetch', 'depends', ' gles-um-compile:do_deploy ')
-}
+FILES:${PN}:append = " \
+    ${libdir}/libsutu_display.so* \
+"

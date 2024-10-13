@@ -1,0 +1,879 @@
+From e675c16ca7188761482c07618c9a56323873e421 Mon Sep 17 00:00:00 2001
+Message-Id: <e675c16ca7188761482c07618c9a56323873e421.1728389216.git.mykyta_poturai@epam.com>
+In-Reply-To: <bc35a1559ba18018db00e017ef9359f091274151.1728389216.git.mykyta_poturai@epam.com>
+References: <bc35a1559ba18018db00e017ef9359f091274151.1728389216.git.mykyta_poturai@epam.com>
+From: Oleksandr Andrushchenko <oleksandr_andrushchenko@epam.com>
+Date: Wed, 13 Sep 2017 11:43:23 +0300
+Subject: [PATCH 03/22] Implement front/back communication channel
+
+Implement all required functionality to esteblish and run
+communication channel between front and back Xen drivers.
+
+Signed-off-by: Oleksandr Andrushchenko <oleksandr_andrushchenko@epam.com>
+Signed-off-by: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+---
+ .../system/rogue/common/env/xen/xen_back.c    | 294 ++++++++++++-
+ .../system/rogue/common/env/xen/xen_back.h    |  16 +
+ .../system/rogue/common/env/xen/xen_front.c   | 394 ++++++++++++++++++
+ .../system/rogue/common/env/xen/xen_front.h   |   7 +
+ services/system/rogue/common/vmm_type_xen.c   |  25 +-
+ 5 files changed, 734 insertions(+), 2 deletions(-)
+ create mode 100644 services/system/rogue/common/env/xen/xen_back.h
+ create mode 100644 services/system/rogue/common/env/xen/xen_front.h
+
+diff --git a/services/system/rogue/common/env/xen/xen_back.c b/services/system/rogue/common/env/xen/xen_back.c
+index 412c119..5518204 100644
+--- a/services/system/rogue/common/env/xen/xen_back.c
++++ b/services/system/rogue/common/env/xen/xen_back.c
+@@ -22,21 +22,313 @@
+ #include "vmm_impl.h"
+ 
+ #include "pvzif.h"
++#include "xen_back.h"
+ #include "xen_debug.h"
+ 
++#define VGSX_BAD_DEVICE_ID	-1
++
++struct xdrv_evtchnl_info {
++	struct xdrv_info *drv_info;
++	struct xen_gsxif_back_ring ring;
++	void *sring;
++	int irq;
++};
++
++struct xdrv_info {
++	struct xenbus_device *xb_dev;
++	struct xdrv_evtchnl_info evt_chnl;
++	struct work_struct op_work;
++	uint32_t osid;
++	/* guest FW heap device ID - used to unmap if domain crashes */
++	uint32_t dev_id;
++};
++
++static VMM_PVZ_CONNECTION *xen_back_pvz_connection;
++
++/* this is used to translate OSID to domain ID */
++domid_t vgpu_img_osid_to_domid[RGXFW_MAX_NUM_OS] = { VGSX_BAD_DOMAIN_ID };
++
++domid_t vgpu_img_get_domid(int osid)
++{
++	if (osid >= RGXFW_MAX_NUM_OS)
++		return VGSX_BAD_DOMAIN_ID;
++	return vgpu_img_osid_to_domid[osid];
++}
++
++static bool vgpu_img_set_domid(int osid, int domid)
++{
++	if (osid >= RGXFW_MAX_NUM_OS)
++		return false;
++
++	if (vgpu_img_osid_to_domid[osid] != 0)
++		return false;
++
++	vgpu_img_osid_to_domid[osid] = domid;
++	return true;
++}
++
++static bool vgpu_img_reset_domid(int osid, int domid)
++{
++	if (osid >= RGXFW_MAX_NUM_OS)
++		return false;
++
++	vgpu_img_osid_to_domid[osid] = domid;
++	return true;
++}
++
++static struct xengsx_resp *be_prepare_resp(struct xdrv_info *xdrv_info,
++	uint8_t operation, uint16_t id)
++{
++	struct xengsx_resp *resp;
++	struct xdrv_evtchnl_info *evt_chnl = &xdrv_info->evt_chnl;
++
++	resp = RING_GET_RESPONSE(&evt_chnl->ring, evt_chnl->ring.rsp_prod_pvt);
++	resp->operation = operation;
++	resp->id = id;
++	return resp;
++}
++
++static inline void xdrv_evtchnl_flush(
++		struct xdrv_evtchnl_info *channel)
++{
++	int notify;
++
++	channel->ring.rsp_prod_pvt++;
++	RING_PUSH_RESPONSES_AND_CHECK_NOTIFY(&channel->ring, notify);
++	if (notify)
++		notify_remote_via_irq(channel->irq);
++}
++
++static void xdrv_do_op(struct work_struct *data)
++{
++	struct xdrv_info *drv_info =
++		container_of(data, struct xdrv_info, op_work);
++	struct xdrv_evtchnl_info *evt_chnl = &drv_info->evt_chnl;
++	struct xengsx_resp *resp;
++	int more_to_do;
++
++	do {
++		struct xengsx_req req;
++		RING_IDX rc, rp;
++
++		rc = evt_chnl->ring.req_cons;
++		rp = evt_chnl->ring.sring->req_prod;
++		rmb(); /* Ensure we see queued requests up to 'rp'. */
++
++		while (rc != rp) {
++
++			if (RING_REQUEST_CONS_OVERFLOW(&evt_chnl->ring, rc))
++				break;
++
++			memcpy(&req, RING_GET_REQUEST(&evt_chnl->ring, rc), sizeof(req));
++			evt_chnl->ring.req_cons = ++rc; /* before make_response() */
++
++			/* Apply all sanity checks to /private copy/ of request. */
++			barrier();
++
++			switch (req.operation) {
++			case XENGSX_OP_MAP_DEV_HEAP:
++				/* fallthrough */
++			case XENGSX_OP_UNMAP_DEV_HEAP:
++				resp = be_prepare_resp(drv_info, req.operation,
++					req.id);
++				resp->status = 0;
++				xdrv_evtchnl_flush(evt_chnl);
++				break;
++			default:
++				break;
++			}
++		}
++		RING_FINAL_CHECK_FOR_REQUESTS(&evt_chnl->ring, more_to_do);
++	} while (more_to_do);
++}
++
++static irqreturn_t xdrv_gsxif_fe_int(int irq, void *dev_id)
++{
++	struct xdrv_info *drv_info = (struct xdrv_info *)dev_id;
++
++	schedule_work(&drv_info->op_work);
++	return IRQ_HANDLED;
++}
++
++static inline int xdrv_fe_on_initialized(struct xdrv_info *drv_info)
++{
++	struct xenbus_device *xb_dev = drv_info->xb_dev;
++	struct xdrv_evtchnl_info *evt_chnl = &drv_info->evt_chnl;
++	void *vaddr;
++	unsigned int port, ring_ref, osid;
++	int ret;
++
++	ret = xenbus_scanf(XBT_NIL, xb_dev->otherend, XENGSX_FIELD_EVT_CHNL,
++		"%u", &port);
++	if (ret != 1) {
++		xenbus_dev_fatal(xb_dev, ret,
++			"reading %s/" XENGSX_FIELD_EVT_CHNL, xb_dev->otherend);
++		return ret;
++	}
++
++	ret = xenbus_scanf(XBT_NIL, xb_dev->otherend, XENGSX_FIELD_RING_REF,
++		"%u", &ring_ref);
++	if (ret != 1) {
++		xenbus_dev_fatal(xb_dev, ret,
++			"reading %s/" XENGSX_FIELD_RING_REF, xb_dev->otherend);
++		return ret;
++	}
++
++	ret = xenbus_scanf(XBT_NIL, xb_dev->otherend, XENGSX_FIELD_OSID,
++		"%u", &osid);
++	if (ret != 1) {
++		xenbus_dev_fatal(xb_dev, ret,
++			"reading %s/" XENGSX_FIELD_OSID, xb_dev->otherend);
++		return ret;
++	}
++
++	if (osid > RGXFW_MAX_NUM_OS) {
++		xenbus_dev_fatal(xb_dev, ret,
++			"OSID provided is out of range (%d > %d)",
++			osid, RGXFW_MAX_NUM_OS);
++		return -EINVAL;
++	}
++
++	if (!vgpu_img_set_domid(osid, xb_dev->otherend_id)) {
++		xenbus_dev_fatal(xb_dev, ret, "mapping OSID %d to DomID %d",
++			osid, xb_dev->otherend_id);
++		return -EINVAL;
++	}
++
++	drv_info->osid = osid;
++	XEN_DEBUG("Mapped OSID %d to DomainID %d", osid, xb_dev->otherend_id);
++
++	ret = xenbus_map_ring_valloc(xb_dev, &ring_ref, 1, &vaddr);
++	if (ret < 0) {
++		xenbus_dev_fatal(xb_dev, ret, "mapping ring buffer");
++		goto fail;
++	}
++
++	BACK_RING_INIT(&evt_chnl->ring, (struct xen_gsxif_sring *)vaddr,
++		XEN_PAGE_SIZE);
++
++	evt_chnl->sring = vaddr;
++
++	ret = bind_interdomain_evtchn_to_irqhandler(xb_dev->otherend_id, port,
++		xdrv_gsxif_fe_int, 0, XENGSX_DRIVER_NAME "-backend", drv_info);
++	if (ret < 0) {
++		xenbus_dev_fatal(xb_dev, ret, "binding IRQ");
++		goto fail;
++	}
++
++	evt_chnl->irq = ret;
++	return 0;
++
++fail:
++	if (evt_chnl->sring)
++		xenbus_unmap_ring_vfree(xb_dev, evt_chnl->sring);
++	evt_chnl->sring = NULL;
++	vgpu_img_reset_domid(osid, 0);
++	drv_info->osid = 0;
++	return ret;
++}
++
++static inline void xdrv_fe_on_disconnected(struct xdrv_info *drv_info)
++{
++	struct xdrv_evtchnl_info *evt_chnl = &drv_info->evt_chnl;
++
++	if (evt_chnl->irq)
++		unbind_from_irqhandler(evt_chnl->irq, drv_info);
++	evt_chnl->irq = 0;
++
++	flush_work(&drv_info->op_work);
++
++	if (evt_chnl->sring != NULL)
++		xenbus_unmap_ring_vfree(drv_info->xb_dev, evt_chnl->sring);
++	evt_chnl->sring = NULL;
++
++	drv_info->osid = 0;
++}
++
++static inline void xdrv_fe_close(struct xdrv_info *drv_info)
++{
++	struct xenbus_device *xb_dev = drv_info->xb_dev;
++
++	xenbus_switch_state(xb_dev, XenbusStateClosing);
++	xdrv_fe_on_disconnected(drv_info);
++	xenbus_switch_state(xb_dev, XenbusStateClosed);
++}
++
+ static void xdrv_fe_on_changed(struct xenbus_device *xb_dev,
+ 	enum xenbus_state frontend_state)
+ {
++	struct xdrv_info *drv_info = dev_get_drvdata(&xb_dev->dev);
++	int ret;
++
++	XEN_DEBUG("%s.%d: Backend is %s frontend is %s",
++		xb_dev->devicetype, xb_dev->otherend_id,
++		xenbus_strstate(xb_dev->state), xenbus_strstate(frontend_state));
++
++	switch (frontend_state) {
++	case XenbusStateReconfiguring:
++		/* fall through */
++	case XenbusStateReconfigured:
++		/* fall through */
++	case XenbusStateInitWait:
++		break;
++
++	case XenbusStateUnknown:
++		xdrv_fe_close(drv_info);
++		break;
++
++	case XenbusStateClosing:
++		/* fall through */
++	case XenbusStateClosed:
++		/* fall through */
++	case XenbusStateInitialising:
++		if (xb_dev->state == XenbusStateInitWait)
++			break;
++
++		xdrv_fe_on_disconnected(drv_info);
++		xenbus_switch_state(xb_dev, XenbusStateInitWait);
++		break;
++
++	case XenbusStateInitialised:
++		if (xb_dev->state == XenbusStateConnected)
++			break;
++
++		ret = xdrv_fe_on_initialized(drv_info);
++		if (ret < 0)
++			break;
++
++		xenbus_switch_state(xb_dev, XenbusStateConnected);
++		break;
++
++	case XenbusStateConnected:
++		break;
++	}
+ }
+ 
+ static int xdrv_probe(struct xenbus_device *xb_dev,
+ 	const struct xenbus_device_id *id)
+ {
++	struct xdrv_info *drv_info;
++
++	drv_info = devm_kzalloc(&xb_dev->dev, sizeof(*drv_info), GFP_KERNEL);
++	if (!drv_info) {
++		xenbus_dev_fatal(xb_dev, -ENOMEM, "allocating device memory");
++		return -ENOMEM;
++	}
++
++	drv_info->xb_dev = xb_dev;
++	drv_info->dev_id = VGSX_BAD_DEVICE_ID;
++	INIT_WORK(&drv_info->op_work, xdrv_do_op);
++	dev_set_drvdata(&xb_dev->dev, drv_info);
++	xenbus_switch_state(xb_dev, XenbusStateInitWait);
+ 	return 0;
+ }
+ 
+ static int xdrv_remove(struct xenbus_device *xb_dev)
+ {
++	struct xdrv_info *drv_info = dev_get_drvdata(&xb_dev->dev);
++
++	xdrv_fe_close(drv_info);
+ 	return 0;
+ }
+ 
+@@ -60,7 +352,7 @@ int gsx_back_init(VMM_PVZ_CONNECTION *pvz_connection)
+ 		return -ENODEV;
+ 
+ 	XEN_INFO("Initializing backend driver");
+-
++	xen_back_pvz_connection = pvz_connection;
+ 	ret = xenbus_register_backend(&xen_driver);
+ 	if (ret < 0)
+ 		XEN_ERROR("Failed to initialize backend driver, ret %d", ret);
+diff --git a/services/system/rogue/common/env/xen/xen_back.h b/services/system/rogue/common/env/xen/xen_back.h
+new file mode 100644
+index 0000000..ec8b2b2
+--- /dev/null
++++ b/services/system/rogue/common/env/xen/xen_back.h
+@@ -0,0 +1,16 @@
++#ifndef __XEN_BACK_H__
++#define __XEN_BACK_H__
++
++#include "pvrsrv.h"
++#include "vmm_impl.h"
++
++#include <xen/interface/xen.h>
++
++#define VGSX_BAD_DOMAIN_ID	-1
++
++int gsx_back_init(VMM_PVZ_CONNECTION *pvz_connection);
++void gsx_back_cleanup(void);
++
++domid_t vgpu_img_get_domid(int osid);
++
++#endif /* __XEN_BACK_H__ */
+diff --git a/services/system/rogue/common/env/xen/xen_front.c b/services/system/rogue/common/env/xen/xen_front.c
+index 4716e09..35e9322 100644
+--- a/services/system/rogue/common/env/xen/xen_front.c
++++ b/services/system/rogue/common/env/xen/xen_front.c
+@@ -14,27 +14,398 @@
+  * Author: Oleksandr Andrushchenko <oleksandr_andrushchenko@epam.com>
+  */
+ 
++#include <linux/delay.h>
++
+ #include <xen/events.h>
+ #include <xen/grant_table.h>
+ #include <xen/xen.h>
+ #include <xen/xenbus.h>
+ 
+ #include "pvzif.h"
++#include "xen_front.h"
+ #include "xen_debug.h"
+ 
++/*
++ * FIXME: usage of grant reference 0 as invalid grant reference:
++ * grant reference 0 is valid, but never exposed to a PV driver,
++ * because of the fact it is already in use/reserved by the PV console.
++ */
++#define GRANT_INVALID_REF	0
++/* timeout in ms to wait for backend to respond */
++#define VGSX_WAIT_BACK_MS	3000
++
++enum xdrv_evtchnl_state {
++	EVTCHNL_STATE_DISCONNECTED,
++	EVTCHNL_STATE_CONNECTED,
++};
++
++struct xdrv_evtchnl_info {
++	struct xdrv_info *drv_info;
++	struct xen_gsxif_front_ring ring;
++	int ring_ref;
++	int port;
++	int irq;
++	struct completion completion;
++	enum xdrv_evtchnl_state state;
++	uint8_t req_next_id;
++	/* latest response status and its corresponding id */
++	int resp_status;
++	uint16_t resp_id;
++};
++
++struct xdrv_info {
++	struct xenbus_device *xb_dev;
++	spinlock_t io_lock;
++	struct xdrv_evtchnl_info evt_chnl;
++	/*
++	 * Upon exit from gsx_front_init PVZ expects that we have connection
++	 * established. In case of a PV connection this is multi-step:
++	 *  - register frontend
++	 *  - setup ring and event channel
++	 *  - wait for the backend to go into connected state
++	 * For that reason we will block on pvz_completion until this is done
++	 */
++	struct completion pvz_completion;
++};
++
++struct xdrv_info xen_front_drv_info;
++
++static inline struct xdrv_info *xdrv_get_drv_info(void)
++{
++	return &xen_front_drv_info;
++}
++
++static inline void xdrv_evtchnl_flush(struct xdrv_evtchnl_info *channel);
++
++static struct xengsx_req *be_prepare_req(struct xdrv_info *xdrv_info,
++	uint8_t operation)
++{
++	struct xengsx_req *req;
++	struct xdrv_evtchnl_info *evt_chnl = &xdrv_info->evt_chnl;
++
++	req = RING_GET_REQUEST(&evt_chnl->ring, evt_chnl->ring.req_prod_pvt);
++	req->operation = operation;
++	req->id = evt_chnl->req_next_id++;
++	evt_chnl->resp_id = req->id;
++	return req;
++}
++
++static int be_do_io(struct xdrv_evtchnl_info *evtchnl)
++{
++	if (unlikely(evtchnl->state != EVTCHNL_STATE_CONNECTED))
++		return -EIO;
++
++	reinit_completion(&evtchnl->completion);
++	xdrv_evtchnl_flush(evtchnl);
++	return 0;
++}
++
++static inline int be_wait_io(struct xdrv_evtchnl_info *evtchnl)
++{
++	if (wait_for_completion_timeout(
++			&evtchnl->completion,
++			msecs_to_jiffies(VGSX_WAIT_BACK_MS)) <= 0)
++		return -ETIMEDOUT;
++	return evtchnl->resp_status;
++}
++
++static irqreturn_t xdrv_evtchnl_interrupt(int irq, void *dev_id)
++{
++	struct xdrv_evtchnl_info *channel = dev_id;
++	struct xdrv_info *drv_info = channel->drv_info;
++	struct xengsx_resp *resp;
++	RING_IDX i, rp;
++	unsigned long flags;
++
++	spin_lock_irqsave(&drv_info->io_lock, flags);
++	if (unlikely(channel->state != EVTCHNL_STATE_CONNECTED))
++		goto out;
++
++again:
++	rp = channel->ring.sring->rsp_prod;
++	/* ensure we see queued responses up to rp */
++	rmb();
++
++	for (i = channel->ring.rsp_cons; i != rp; i++) {
++		resp = RING_GET_RESPONSE(&channel->ring, i);
++		if (resp->id != channel->resp_id)
++			continue;
++		switch (resp->operation) {
++		case XENGSX_OP_MAP_DEV_HEAP:
++			/* fall through */
++		case XENGSX_OP_UNMAP_DEV_HEAP:
++			channel->resp_status = resp->status;
++			complete(&channel->completion);
++			break;
++
++		default:
++			dev_err(&drv_info->xb_dev->dev,
++				"Operation %d is not supported\n",
++				resp->operation);
++			break;
++		}
++	}
++
++	channel->ring.rsp_cons = i;
++	if (i != channel->ring.req_prod_pvt) {
++		int more_to_do;
++
++		RING_FINAL_CHECK_FOR_RESPONSES(&channel->ring, more_to_do);
++		if (more_to_do)
++			goto again;
++	} else
++		channel->ring.sring->rsp_event = i + 1;
++
++out:
++	spin_unlock_irqrestore(&drv_info->io_lock, flags);
++	return IRQ_HANDLED;
++}
++
++static inline void xdrv_evtchnl_flush(
++		struct xdrv_evtchnl_info *channel)
++{
++	int notify;
++
++	channel->ring.req_prod_pvt++;
++	RING_PUSH_REQUESTS_AND_CHECK_NOTIFY(&channel->ring, notify);
++	if (notify)
++		notify_remote_via_irq(channel->irq);
++}
++
++static void xdrv_evtchnl_free(struct xdrv_info *drv_info)
++{
++	struct xdrv_evtchnl_info *evt_chnl = &drv_info->evt_chnl;
++	unsigned long flags;
++
++	spin_lock_irqsave(&drv_info->io_lock, flags);
++	drv_info->evt_chnl.state = EVTCHNL_STATE_DISCONNECTED;
++	spin_unlock_irqrestore(&drv_info->io_lock, flags);
++	evt_chnl->resp_status = -EIO;
++
++	if (evt_chnl->irq)
++		unbind_from_irqhandler(evt_chnl->irq, evt_chnl);
++	evt_chnl->irq = 0;
++
++	if (evt_chnl->port)
++		xenbus_free_evtchn(drv_info->xb_dev, evt_chnl->port);
++	evt_chnl->port = 0;
++
++	if (evt_chnl->ring_ref != GRANT_INVALID_REF)
++		gnttab_end_foreign_access(evt_chnl->ring_ref, 0,
++			(unsigned long)evt_chnl->ring.sring);
++	evt_chnl->ring_ref = GRANT_INVALID_REF;
++	evt_chnl->ring.sring = NULL;
++}
++
++static int xdrv_evtchnl_alloc(struct xdrv_info *drv_info)
++{
++	struct xenbus_device *xb_dev = drv_info->xb_dev;
++	struct xdrv_evtchnl_info *evt_channel = &drv_info->evt_chnl;
++	struct xen_gsxif_sring *sring;
++	grant_ref_t gref;
++	int ret;
++
++	evt_channel->drv_info = drv_info;
++	init_completion(&evt_channel->completion);
++	evt_channel->state = EVTCHNL_STATE_DISCONNECTED;
++	evt_channel->ring_ref = GRANT_INVALID_REF;
++	evt_channel->ring.sring = NULL;
++	evt_channel->port = 0;
++	evt_channel->irq = 0;
++
++	sring = (struct xen_gsxif_sring *)get_zeroed_page(
++		GFP_NOIO | __GFP_HIGH);
++	if (!sring) {
++		ret = -ENOMEM;
++		goto fail;
++	}
++
++	SHARED_RING_INIT(sring);
++	FRONT_RING_INIT(&evt_channel->ring, sring, XEN_PAGE_SIZE);
++	ret = xenbus_grant_ring(xb_dev, sring, 1, &gref);
++	if (ret < 0)
++		goto fail;
++	evt_channel->ring_ref = gref;
++
++	ret = xenbus_alloc_evtchn(xb_dev, &evt_channel->port);
++	if (ret < 0)
++		goto fail;
++
++	ret = bind_evtchn_to_irqhandler(evt_channel->port,
++		xdrv_evtchnl_interrupt, 0, xb_dev->devicetype, evt_channel);
++	if (ret < 0)
++		goto fail;
++
++	evt_channel->irq = ret;
++	return 0;
++
++fail:
++	dev_err(&xb_dev->dev, "Failed to allocate ring: %d\n", ret);
++	return ret;
++}
++
++static int xdrv_evtchnl_create(struct xdrv_info *drv_info)
++{
++	struct xdrv_evtchnl_info *evt_channel = &drv_info->evt_chnl;
++	int ret;
++
++	ret = xdrv_evtchnl_alloc(drv_info);
++	if (ret < 0) {
++		dev_err(&drv_info->xb_dev->dev,
++			"allocating event channel: %d\n", ret);
++		return ret;
++	}
++
++	/*
++	 * write values to Xen store, so backend can find ring reference
++	 * and event channel
++	 */
++	ret = xenbus_printf(XBT_NIL, drv_info->xb_dev->nodename,
++		XENGSX_FIELD_RING_REF, "%u", evt_channel->ring_ref);
++	if (ret < 0) {
++		dev_err(&drv_info->xb_dev->dev,
++			"writing " XENGSX_FIELD_RING_REF": %d\n", ret);
++		return ret;
++	}
++
++	ret = xenbus_printf(XBT_NIL, drv_info->xb_dev->nodename,
++		XENGSX_FIELD_EVT_CHNL, "%u", evt_channel->port);
++	if (ret < 0) {
++		dev_err(&drv_info->xb_dev->dev,
++			"writing " XENGSX_FIELD_EVT_CHNL": %d\n", ret);
++		return ret;
++	}
++	return 0;
++}
++
++static inline int xdrv_be_on_initwait(struct xdrv_info *drv_info)
++{
++	return xdrv_evtchnl_create(drv_info);
++}
++
++static inline int xdrv_be_on_connected(struct xdrv_info *drv_info)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&drv_info->io_lock, flags);
++	drv_info->evt_chnl.state = EVTCHNL_STATE_CONNECTED;
++	spin_unlock_irqrestore(&drv_info->io_lock, flags);
++	return 0;
++}
++
++static inline void xdrv_be_on_disconnected(struct xdrv_info *drv_info)
++{
++	xdrv_evtchnl_free(drv_info);
++	xenbus_switch_state(drv_info->xb_dev, XenbusStateInitialising);
++}
++
+ static void xdrv_be_on_changed(struct xenbus_device *xb_dev,
+ 	enum xenbus_state backend_state)
+ {
++	struct xdrv_info *drv_info = dev_get_drvdata(&xb_dev->dev);
++	int ret;
++
++	XEN_DEBUG("Backend is %s frontend is %s",
++		xenbus_strstate(backend_state),
++		xenbus_strstate(xb_dev->state));
++	switch (backend_state) {
++	case XenbusStateReconfiguring:
++		/* fall through */
++	case XenbusStateReconfigured:
++		/* fall through */
++	case XenbusStateInitialised:
++		break;
++
++	case XenbusStateInitialising:
++		/* recovering after backend unexpected closure */
++		xdrv_be_on_disconnected(drv_info);
++		break;
++
++	case XenbusStateInitWait:
++		/* recovering after backend unexpected closure */
++		xdrv_be_on_disconnected(drv_info);
++		if (xb_dev->state != XenbusStateInitialising)
++			break;
++		ret = xdrv_be_on_initwait(drv_info);
++		if (ret < 0) {
++			xenbus_dev_fatal(xb_dev, ret,
++				"initializing " XENGSX_DRIVER_NAME);
++			break;
++		}
++		xenbus_switch_state(xb_dev, XenbusStateInitialised);
++		break;
++
++	case XenbusStateConnected:
++		if (xb_dev->state != XenbusStateInitialised)
++			break;
++
++		ret = xdrv_be_on_connected(drv_info);
++		if (ret < 0) {
++			xenbus_dev_fatal(xb_dev, ret,
++				"connecting " XENGSX_DRIVER_NAME);
++			break;
++		}
++
++		xenbus_switch_state(xb_dev, XenbusStateConnected);
++		complete(&drv_info->pvz_completion);
++		break;
++
++	case XenbusStateClosing:
++		/*
++		 * in this state backend starts freeing resources,
++		 * so let it go into closed state first, so we can also
++		 * remove ours
++		 */
++		break;
++
++	case XenbusStateUnknown:
++		/* fall through */
++	case XenbusStateClosed:
++		if (xb_dev->state == XenbusStateClosed)
++			break;
++
++		xdrv_be_on_disconnected(drv_info);
++		xenbus_switch_state(xb_dev, XenbusStateInitialising);
++		break;
++	}
+ }
+ 
+ static int xdrv_probe(struct xenbus_device *xb_dev,
+ 	const struct xenbus_device_id *id)
+ {
++	struct xdrv_info *drv_info = xdrv_get_drv_info();
++
++	drv_info->xb_dev = xb_dev;
++	spin_lock_init(&drv_info->io_lock);
++	dev_set_drvdata(&xb_dev->dev, drv_info);
++	xenbus_switch_state(xb_dev, XenbusStateInitialising);
+ 	return 0;
+ }
+ 
+ static int xdrv_remove(struct xenbus_device *xb_dev)
+ {
++	struct xdrv_info *drv_info = dev_get_drvdata(&xb_dev->dev);
++	int to = 10;
++
++	/*
++	 * FIXME: on driver removal it is disconnected from XenBus,
++	 * so no backend state change events come in via .otherend_changed
++	 * callback. This prevents us from exiting gracefully, e.g.
++	 * signaling the backend to free event channels, waiting for its
++	 * state change to closed and cleaning at our end.
++	 * Workaround: read backend's state manually
++	 */
++	xenbus_switch_state(xb_dev, XenbusStateClosing);
++	while ((xenbus_read_unsigned(xb_dev->otherend,
++		"state", XenbusStateUnknown) != XenbusStateInitWait) && to--)
++		msleep(10);
++	if (!to)
++		XEN_ERROR("Backend state is %s while removing driver",
++			xenbus_strstate(xenbus_read_unsigned(
++					xb_dev->otherend,
++					"state", XenbusStateUnknown)));
++	xdrv_evtchnl_free(drv_info);
++	xenbus_switch_state(xb_dev, XenbusStateClosed);
+ 	return 0;
+ }
+ 
+@@ -52,6 +423,7 @@ static struct xenbus_driver xen_driver = {
+ 
+ int gsx_front_init(void)
+ {
++	struct xdrv_info *drv_info;
+ 	int ret;
+ 
+ 	if (!xen_domain())
+@@ -59,9 +431,31 @@ int gsx_front_init(void)
+ 
+ 	XEN_INFO("Initializing frontend driver");
+ 
++	drv_info = xdrv_get_drv_info();
++
++	init_completion(&drv_info->pvz_completion);
++
+ 	ret = xenbus_register_frontend(&xen_driver);
+ 	if (ret < 0)
+ 		XEN_ERROR("Failed to initialize frontend driver, ret %d", ret);
+ 
++	/* wait for the backend to connect */
++	/*
++	 * FIXME: PVR KM doesn't check the return value, but in DEBUG
++	 * build will ASSERT. To prevent that wait until interrupted
++	 * instead of timeout
++	 */
++	if (wait_for_completion_interruptible(&drv_info->pvz_completion) < 0)
++		return -ETIMEDOUT;
+ 	return 0;
+ }
++
++void gsx_front_cleanup(void)
++{
++	XEN_INFO("Unregistering frontend driver");
++	/*
++	 * XXX: do we also need to make this synchronous and wait for
++	 * the backend to disconnect first?
++	 */
++	xenbus_unregister_driver(&xen_driver);
++}
+diff --git a/services/system/rogue/common/env/xen/xen_front.h b/services/system/rogue/common/env/xen/xen_front.h
+new file mode 100644
+index 0000000..83b8050
+--- /dev/null
++++ b/services/system/rogue/common/env/xen/xen_front.h
+@@ -0,0 +1,7 @@
++#ifndef __XEN_FRONT_H__
++#define __XEN_FRONT_H__
++
++int gsx_front_init(void);
++void gsx_front_cleanup(void);
++
++#endif /* __XEN_FRONT_H__ */
+diff --git a/services/system/rogue/common/vmm_type_xen.c b/services/system/rogue/common/vmm_type_xen.c
+index e9909df..cd59c79 100644
+--- a/services/system/rogue/common/vmm_type_xen.c
++++ b/services/system/rogue/common/vmm_type_xen.c
+@@ -48,6 +48,8 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ #include "vmm_impl.h"
+ #include "vmm_pvz_server.h"
+ #include "vmm_pvz_client.h"
++#include "xen_front.h"
++#include "xen_back.h"
+ 
+ #include <xen/xen.h>
+ #include "xen_debug.h"
+@@ -105,12 +107,33 @@ int XenPvzServerMapDevPhysHeapOSID;
+ 
+ static PVRSRV_ERROR XenCreatePvzConnection(VMM_PVZ_CONNECTION *psPvzConnection)
+ {
++	int ret;
++
+ 	PVR_UNREFERENCED_PARAMETER(psPvzConnection);
+-	return PVRSRV_OK;
++	if (PVRSRV_VZ_MODE_IS(GUEST)) {
++		ret = gsx_front_init();
++		if (ret < 0) {
++			gsx_front_cleanup();
++			XEN_ERROR("Failed to initialize frontend: %d", ret);
++			ret = PVRSRV_ERROR_INIT_FAILURE;
++		}
++		return ret;
++	}
++	ret = gsx_back_init(psPvzConnection);
++	if (ret < 0) {
++		gsx_back_cleanup();
++		XEN_ERROR("Failed to initialize backend: %d", ret);
++		ret = PVRSRV_ERROR_INIT_FAILURE;
++	}
++	return ret;
+ }
+ 
+ static void XenDestroyPvzConnection(void)
+ {
++	if (PVRSRV_VZ_MODE_IS(GUEST))
++		gsx_front_cleanup();
++	else
++		gsx_back_cleanup();
+ }
+ 
+ static VMM_PVZ_CONNECTION gsXenVmmPvz =
+-- 
+2.34.1
+

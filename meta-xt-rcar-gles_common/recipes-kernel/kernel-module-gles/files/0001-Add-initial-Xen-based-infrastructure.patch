@@ -1,0 +1,401 @@
+From df3786db26280c3b935a0e91d707a7c711e7fb11 Mon Sep 17 00:00:00 2001
+Message-Id: <df3786db26280c3b935a0e91d707a7c711e7fb11.1728809840.git.mykyta_poturai@epam.com>
+From: Oleksandr Andrushchenko <oleksandr_andrushchenko@epam.com>
+Date: Wed, 13 Sep 2017 10:43:16 +0300
+Subject: [PATCH] Add initial Xen based infrastructure
+
+This adds Xen front and backend infrastructure and also
+implements very basic PVZ connection handling and setup.
+
+Signed-off-by: Oleksandr Andrushchenko <oleksandr_andrushchenko@epam.com>
+Signed-off-by: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+
+---
+ .../system/rogue/common/env/xen/xen_back.c    |  75 ++++++++
+ .../system/rogue/common/env/xen/xen_debug.h   |  20 +++
+ .../system/rogue/common/env/xen/xen_front.c   |  66 +++++++
+ services/system/rogue/common/vmm_type_xen.c   | 165 ++++++++++++++++++
+ services/system/rogue/rgx_rcar/Kbuild.mk      |  15 +-
+ 5 files changed, 340 insertions(+), 1 deletion(-)
+ create mode 100644 services/system/rogue/common/env/xen/xen_back.c
+ create mode 100644 services/system/rogue/common/env/xen/xen_debug.h
+ create mode 100644 services/system/rogue/common/env/xen/xen_front.c
+ create mode 100644 services/system/rogue/common/vmm_type_xen.c
+
+diff --git a/services/system/rogue/common/env/xen/xen_back.c b/services/system/rogue/common/env/xen/xen_back.c
+new file mode 100644
+index 0000000..6fa8f4d
+--- /dev/null
++++ b/services/system/rogue/common/env/xen/xen_back.c
+@@ -0,0 +1,75 @@
++/*
++ *   This program is free software; you can redistribute it and/or modify
++ *   it under the terms of the GNU General Public License as published by
++ *   the Free Software Foundation; either version 2 of the License, or
++ *   (at your option) any later version.
++ *
++ *   This program is distributed in the hope that it will be useful,
++ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *   GNU General Public License for more details.
++ *
++ * Copyright (C) 2017 EPAM Systems Inc.
++ *
++ * Author: Oleksandr Andrushchenko <oleksandr_andrushchenko@epam.com>
++ */
++
++#include <xen/events.h>
++#include <xen/grant_table.h>
++#include <xen/xen.h>
++#include <xen/xenbus.h>
++
++#include "vmm_impl.h"
++
++#include "xen_debug.h"
++
++static void xdrv_fe_on_changed(struct xenbus_device *xb_dev,
++	enum xenbus_state frontend_state)
++{
++}
++
++static int xdrv_probe(struct xenbus_device *xb_dev,
++	const struct xenbus_device_id *id)
++{
++	return 0;
++}
++
++static int xdrv_remove(struct xenbus_device *xb_dev)
++{
++	return 0;
++}
++
++static const struct xenbus_device_id xdrv_ids[] = {
++	{ "vgsx" },
++	{ "" }
++};
++
++static struct xenbus_driver xen_driver = {
++	.ids = xdrv_ids,
++	.probe = xdrv_probe,
++	.remove = xdrv_remove,
++	.otherend_changed = xdrv_fe_on_changed,
++};
++
++int gsx_back_init(VMM_PVZ_CONNECTION *pvz_connection)
++{
++	int ret;
++
++	if (!xen_domain())
++		return -ENODEV;
++
++	XEN_INFO("Initializing backend driver");
++
++	ret = xenbus_register_backend(&xen_driver);
++	if (ret < 0)
++		XEN_ERROR("Failed to initialize backend driver, ret %d", ret);
++
++	return ret;
++}
++
++void gsx_back_cleanup(void)
++{
++	XEN_INFO("Unregistering backend driver");
++	xenbus_unregister_driver(&xen_driver);
++}
++
+diff --git a/services/system/rogue/common/env/xen/xen_debug.h b/services/system/rogue/common/env/xen/xen_debug.h
+new file mode 100644
+index 0000000..4294b8b
+--- /dev/null
++++ b/services/system/rogue/common/env/xen/xen_debug.h
+@@ -0,0 +1,20 @@
++#ifndef __XEN_DEBUG_H__
++#define __XEN_DEBUG_H__
++
++#define XEN_LOG(level, fmt, ...)						\
++	do {									\
++		printk(KERN_##level "vgsx:(%s:%d): " fmt "\n",	\
++				__FUNCTION__, __LINE__ , ## __VA_ARGS__);	\
++	} while (0)
++
++#define XEN_INFO(fmt, ...)	XEN_LOG(INFO, fmt, ## __VA_ARGS__)
++#define XEN_WARN(fmt, ...)	XEN_LOG(WARNING, fmt, ## __VA_ARGS__)
++#define XEN_ERROR(fmt, ...)	XEN_LOG(ERR, fmt, ## __VA_ARGS__)
++
++#if defined(CONFIG_DEBUG)
++#define XEN_DEBUG(fmt, ...)	XEN_LOG(DEBUG, fmt, ## __VA_ARGS__)
++#else
++#define XEN_DEBUG(level, fmt, ...) do {} while(0)
++#endif
++
++#endif /* __XEN_DEBUG_H__ */
+diff --git a/services/system/rogue/common/env/xen/xen_front.c b/services/system/rogue/common/env/xen/xen_front.c
+new file mode 100644
+index 0000000..a9c1356
+--- /dev/null
++++ b/services/system/rogue/common/env/xen/xen_front.c
+@@ -0,0 +1,66 @@
++/*
++ *   This program is free software; you can redistribute it and/or modify
++ *   it under the terms of the GNU General Public License as published by
++ *   the Free Software Foundation; either version 2 of the License, or
++ *   (at your option) any later version.
++ *
++ *   This program is distributed in the hope that it will be useful,
++ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *   GNU General Public License for more details.
++ *
++ * Copyright (C) 2017 EPAM Systems Inc.
++ *
++ * Author: Oleksandr Andrushchenko <oleksandr_andrushchenko@epam.com>
++ */
++
++#include <xen/events.h>
++#include <xen/grant_table.h>
++#include <xen/xen.h>
++#include <xen/xenbus.h>
++
++#include "xen_debug.h"
++
++static void xdrv_be_on_changed(struct xenbus_device *xb_dev,
++	enum xenbus_state backend_state)
++{
++}
++
++static int xdrv_probe(struct xenbus_device *xb_dev,
++	const struct xenbus_device_id *id)
++{
++	return 0;
++}
++
++static int xdrv_remove(struct xenbus_device *xb_dev)
++{
++	return 0;
++}
++
++static const struct xenbus_device_id xdrv_ids[] = {
++	{ "vgsx" },
++	{ "" }
++};
++
++static struct xenbus_driver xen_driver = {
++	.ids = xdrv_ids,
++	.probe = xdrv_probe,
++	.remove = xdrv_remove,
++	.otherend_changed = xdrv_be_on_changed,
++};
++
++int gsx_front_init(void)
++{
++	int ret;
++
++	if (!xen_domain())
++		return -ENODEV;
++
++	XEN_INFO("Initializing frontend driver");
++
++	ret = xenbus_register_frontend(&xen_driver);
++	if (ret < 0)
++		XEN_ERROR("Failed to initialize frontend driver, ret %d", ret);
++
++	return 0;
++}
+diff --git a/services/system/rogue/common/vmm_type_xen.c b/services/system/rogue/common/vmm_type_xen.c
+new file mode 100644
+index 0000000..e9909df
+--- /dev/null
++++ b/services/system/rogue/common/vmm_type_xen.c
+@@ -0,0 +1,165 @@
++/*************************************************************************/ /*!
++@File			vmm_type_xen.c
++@Title          Xen VM manager type
++@Copyright      Copyright (c) EPAM Systems Inc. All Rights Reserved
++@Description    Xen VM manager implementation
++@License        Dual MIT/GPLv2
++
++The contents of this file are subject to the MIT license as set out below.
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in
++all copies or substantial portions of the Software.
++
++Alternatively, the contents of this file may be used under the terms of
++the GNU General Public License Version 2 ("GPL") in which case the provisions
++of GPL are applicable instead of those above.
++
++If you wish to allow use of your version of this file only under the terms of
++GPL, and not to allow others to use your version of this file under the terms
++of the MIT license, indicate your decision by deleting the provisions above
++and replace them with the notice and other provisions required by GPL as set
++out in the file called "GPL-COPYING" included in this distribution. If you do
++not delete the provisions above, a recipient may use your version of this file
++under the terms of either the MIT license or GPL.
++
++This License is also included in this distribution in the file called
++"MIT-COPYING".
++
++EXCEPT AS OTHERWISE STATED IN A NEGOTIATED AGREEMENT: (A) THE SOFTWARE IS
++PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING
++BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
++PURPOSE AND NONINFRINGEMENT; AND (B) IN NO EVENT SHALL THE AUTHORS OR
++COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
++IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++*/ /**************************************************************************/
++#include "pvrsrv.h"
++#include "img_types.h"
++#include "pvrsrv_error.h"
++#include "rgxheapconfig.h"
++
++#include "vmm_impl.h"
++#include "vmm_pvz_server.h"
++#include "vmm_pvz_client.h"
++
++#include <xen/xen.h>
++#include "xen_debug.h"
++
++static VMM_PVZ_CONNECTION gsXenVmmPvz;
++
++/*
++ *******************************************************************************
++ * Guest code
++ *******************************************************************************
++ */
++
++/*
++ *******************************************************************************
++ * Map/unmap physical heap - are used only when the FW heap origin is the guest
++ *******************************************************************************
++ * These functions are used to communicate the host driver at runtime of the
++ * guest VM device firmware physical heap configuration information,
++ * i.e. VM memory backing firmware allocations. On receiving the call from
++ * the guest, the host driver maps that memory in the host driver FW/kernel
++ * memory mappings.
++ * As the call traverses the VMM, it needs to make sure the memory is also
++ * accessible to OSID0 in the IO-MMU, since it is going to be mapped in the
++ * host driver to be accessed by the FW.
++ *******************************************************************************
++ */
++
++static PVRSRV_ERROR
++XenVmmMapDevPhysHeap(IMG_UINT32 ui32FuncID, IMG_UINT32 ui32DevID,
++	IMG_UINT64 ui64Size, IMG_UINT64 ui64Addr)
++{
++	PVR_UNREFERENCED_PARAMETER(ui32FuncID);
++	PVR_UNREFERENCED_PARAMETER(ui32DevID);
++	PVR_UNREFERENCED_PARAMETER(ui64Size);
++	PVR_UNREFERENCED_PARAMETER(ui64Addr);
++	return PVRSRV_OK;
++}
++
++static PVRSRV_ERROR
++XenVmmUnmapDevPhysHeap(IMG_UINT32 ui32FuncID, IMG_UINT32 ui32DevID)
++{
++	PVR_UNREFERENCED_PARAMETER(ui32FuncID);
++	PVR_UNREFERENCED_PARAMETER(ui32DevID);
++	return PVRSRV_OK;
++}
++
++/*
++ *******************************************************************************
++ * Host code
++ *******************************************************************************
++ */
++
++/* must only be set under PvzServerLock */
++int XenPvzServerMapDevPhysHeapOSID;
++
++static PVRSRV_ERROR XenCreatePvzConnection(VMM_PVZ_CONNECTION *psPvzConnection)
++{
++	PVR_UNREFERENCED_PARAMETER(psPvzConnection);
++	return PVRSRV_OK;
++}
++
++static void XenDestroyPvzConnection(void)
++{
++}
++
++static VMM_PVZ_CONNECTION gsXenVmmPvz =
++{
++	.sClientFuncTab = {
++		/* pfnMapDevPhysHeap */
++		&XenVmmMapDevPhysHeap,
++
++		/* pfnUnmapDevPhysHeap */
++		&XenVmmUnmapDevPhysHeap
++	},
++
++	.sServerFuncTab = {
++		/* pfnMapDevPhysHeap */
++		&PvzServerMapDevPhysHeap,
++
++		/* pfnUnmapDevPhysHeap */
++		&PvzServerUnmapDevPhysHeap
++	},
++
++	.sVmmFuncTab = {
++		/* pfnOnVmOnline */
++		&PvzServerOnVmOnline,
++
++		/* pfnOnVmOffline */
++		&PvzServerOnVmOffline,
++
++		/* pfnVMMConfigure */
++		&PvzServerVMMConfigure
++	}
++};
++
++/*
++ *******************************************************************************
++ * Common code
++ *******************************************************************************
++ */
++
++PVRSRV_ERROR VMMCreatePvzConnection(VMM_PVZ_CONNECTION **psPvzConnection)
++{
++	PVR_LOG_RETURN_IF_FALSE((NULL != psPvzConnection), "VMMCreatePvzConnection", PVRSRV_ERROR_INVALID_PARAMS);
++	XEN_INFO("Creating Xen PVZ connection");
++	*psPvzConnection = &gsXenVmmPvz;
++	return XenCreatePvzConnection(&gsXenVmmPvz);
++}
++
++void VMMDestroyPvzConnection(VMM_PVZ_CONNECTION *psPvzConnection)
++{
++	PVR_LOG_IF_FALSE((NULL != psPvzConnection), "VMMDestroyPvzConnection");
++	XEN_INFO("Destroying Xen PVZ connection");
++	XenDestroyPvzConnection();
++}
+diff --git a/services/system/rogue/rgx_rcar/Kbuild.mk b/services/system/rogue/rgx_rcar/Kbuild.mk
+index e44d82e..9f02f41 100644
+--- a/services/system/rogue/rgx_rcar/Kbuild.mk
++++ b/services/system/rogue/rgx_rcar/Kbuild.mk
+@@ -45,8 +45,21 @@ $(PVRSRVKM_NAME)-y += services/system/rogue/$(PVR_SYSTEM)/sysconfig.o \
+  services/server/common/vmm_pvz_client.o \
+  services/server/common/vmm_pvz_server.o \
+  services/server/common/vz_vmm_pvz.o \
+- services/server/common/vz_vmm_vm.o \
++ services/server/common/vz_vmm_vm.o
++
++ifeq ($(shell test $(PVRSRV_VZ_NUM_OSID) -gt 1; echo $$?),0)
++ ccflags-y += -I$(TOP)/services/system/rogue/common/env/xen
++endif
++
++ifeq ($(shell test $(PVRSRV_VZ_NUM_OSID) -gt 1; echo $$?),0)
++$(PVRSRVKM_NAME)-y += \
++ services/system/rogue/common/env/xen/xen_front.o \
++ services/system/rogue/common/env/xen/xen_back.o \
++ services/system/rogue/common/vmm_type_xen.o
++else
++$(PVRSRVKM_NAME)-y += \
+  services/system/rogue/common/vmm_type_$(VMM_TYPE).o
++endif
+ 
+ ifeq ($(SUPPORT_ION),1)
+ $(PVRSRVKM_NAME)-y += services/system/common/env/linux/ion_support_generic.o

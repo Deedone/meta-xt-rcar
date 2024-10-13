@@ -1,0 +1,179 @@
+From 81733be3fa894a53160be2957d5f7e0f5aa57538 Mon Sep 17 00:00:00 2001
+Message-Id: <81733be3fa894a53160be2957d5f7e0f5aa57538.1728389216.git.mykyta_poturai@epam.com>
+In-Reply-To: <bc35a1559ba18018db00e017ef9359f091274151.1728389216.git.mykyta_poturai@epam.com>
+References: <bc35a1559ba18018db00e017ef9359f091274151.1728389216.git.mykyta_poturai@epam.com>
+From: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Date: Fri, 21 Sep 2018 12:59:07 +0300
+Subject: [PATCH 14/22] Rewrite balloon implementation to use Xen dedicated CMA
+ allocator
+
+Signed-off-by: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+---
+ .../rogue/common/env/xen/xen_pvz_balloon.c    | 96 +++++++++----------
+ 1 file changed, 47 insertions(+), 49 deletions(-)
+
+diff --git a/services/system/rogue/common/env/xen/xen_pvz_balloon.c b/services/system/rogue/common/env/xen/xen_pvz_balloon.c
+index 33fc9b8..c29cb8a 100644
+--- a/services/system/rogue/common/env/xen/xen_pvz_balloon.c
++++ b/services/system/rogue/common/env/xen/xen_pvz_balloon.c
+@@ -18,9 +18,13 @@
+ 
+ #include <xen/xenbus.h>
+ 
+-#include <asm/xen/hypercall.h>
+-#include <xen/interface/memory.h>
+-#include <xen/page.h>
++#include <xen/xen.h>
++#include <xen/mem-reservation.h>
++#include <xen/grant_table.h>
++
++#if defined(CONFIG_XT_CMA_HELPER)
++#include <xen/xt_cma_helper.h>
++#endif
+ 
+ #include "xen_debug.h"
+ #include "xen_pvz_balloon.h"
+@@ -29,23 +33,22 @@ int xen_pvz_ballooned_pages_alloc(struct device *dev,
+ 		struct xen_pvz_balloon *obj, int num_pages, struct page **pages)
+ {
+ 	xen_pfn_t *frame_list;
+-	size_t size;
++	size_t size = num_pages * PAGE_SIZE;
+ 	int i, ret;
+ 	dma_addr_t dev_addr, cpu_addr;
+ 	void *vaddr = NULL;
+-	struct xen_memory_reservation reservation = {
+-		.address_bits = 0,
+-		.extent_order = 0,
+-		.domid        = DOMID_SELF
+-	};
+-
+-	size = num_pages * PAGE_SIZE;
+-	XEN_DEBUG("Ballooning out %d pages, size %zu\n", num_pages, size);
++
+ 	frame_list = kcalloc(num_pages, sizeof(*frame_list), GFP_KERNEL);
+-	if (!frame_list)
++	if (!frame_list) {
++		XEN_ERROR("Failed to allocate frames to decrease reservation\n");
+ 		return -ENOMEM;
++	}
+ 
++#if defined(CONFIG_XT_CMA_HELPER)
++	vaddr = xt_cma_dma_alloc_wc(dev, size, &dev_addr, GFP_KERNEL | __GFP_NOWARN);
++#else
+ 	vaddr = dma_alloc_wc(dev, size, &dev_addr, GFP_KERNEL | __GFP_NOWARN);
++#endif
+ 	if (!vaddr) {
+ 		XEN_ERROR("Failed to allocate DMA buffer with size %zu\n",
+ 				size);
+@@ -56,25 +59,24 @@ int xen_pvz_ballooned_pages_alloc(struct device *dev,
+ 	cpu_addr = dev_addr;
+ 	for (i = 0; i < num_pages; i++) {
+ 		pages[i] = pfn_to_page(__phys_to_pfn(cpu_addr));
+-		/*
+-		 * XENMEM_populate_physmap requires a PFN based on Xen
+-		 * granularity.
+-		 */
+-		frame_list[i] = page_to_xen_pfn(pages[i]);
++		frame_list[i] = xen_page_to_gfn(pages[i]);
++		xenmem_reservation_scrub_page(pages[i]);
+ 		cpu_addr += PAGE_SIZE;
+ 	}
+-	set_xen_guest_handle(reservation.extent_start, frame_list);
+-	reservation.nr_extents = num_pages;
+-	/* rc will hold number of pages processed */
+-	ret = HYPERVISOR_memory_op(XENMEM_decrease_reservation, &reservation);
+-	if (ret <= 0) {
+-		XEN_ERROR("Failed to balloon out %d pages (%d), retrying\n",
+-				num_pages, ret);
+-		WARN_ON(ret != num_pages);
++
++	xenmem_reservation_va_mapping_reset(num_pages, pages);
++
++	ret = xenmem_reservation_decrease(num_pages, frame_list);
++	if (ret != num_pages) {
++		XEN_ERROR("Failed to decrease reservation for pages\n");
+ 		ret = -EFAULT;
+ 		goto fail;
+ 	}
+ 
++	ret = gnttab_pages_set_private(num_pages, pages);
++	if (ret < 0)
++		goto fail;
++
+ 	obj->vaddr = vaddr;
+ 	obj->dev_bus_addr = dev_addr;
+ 	kfree(frame_list);
+@@ -83,7 +85,11 @@ int xen_pvz_ballooned_pages_alloc(struct device *dev,
+ 
+ fail:
+ 	if (vaddr)
++#if defined(CONFIG_XT_CMA_HELPER)
++		xt_cma_dma_free_wc(dev, size, vaddr, dev_addr);
++#else
+ 		dma_free_wc(dev, size, vaddr, dev_addr);
++#endif
+ 	kfree(frame_list);
+ 	return ret;
+ }
+@@ -93,42 +99,34 @@ void xen_pvz_ballooned_pages_free(struct device *dev,
+ {
+ 	xen_pfn_t *frame_list;
+ 	int i, ret;
+-	size_t size;
+-	struct xen_memory_reservation reservation = {
+-		.address_bits = 0,
+-		.extent_order = 0,
+-		.domid        = DOMID_SELF
+-	};
++	size_t size = num_pages * PAGE_SIZE;
+ 
+ 	if (!pages || !obj->vaddr)
+ 		return;
+ 
++	gnttab_pages_clear_private(num_pages, pages);
++
+ 	frame_list = kcalloc(num_pages, sizeof(*frame_list), GFP_KERNEL);
+ 	if (!frame_list) {
+-		XEN_ERROR("Failed to balloon in %d pages\n", num_pages);
++		XEN_ERROR("Failed to allocate frames to increase reservation\n");
+ 		return;
+ 	}
+ 
+-	XEN_DEBUG("Ballooning in %d pages\n", num_pages);
+-	size = num_pages * PAGE_SIZE;
+-	for (i = 0; i < num_pages; i++) {
+-		/*
+-		 * XENMEM_populate_physmap requires a PFN based on Xen
+-		 * granularity.
+-		 */
++	for (i = 0; i < num_pages; i++)
+ 		frame_list[i] = page_to_xen_pfn(pages[i]);
+-	}
+-	set_xen_guest_handle(reservation.extent_start, frame_list);
+-	reservation.nr_extents = num_pages;
+-	/* rc will hold number of pages processed */
+-	ret = HYPERVISOR_memory_op(XENMEM_populate_physmap, &reservation);
+-	if (ret <= 0) {
+-		XEN_ERROR("Failed to balloon in %d pages\n", num_pages);
+-		WARN_ON(ret != num_pages);
+-	}
++
++	ret = xenmem_reservation_increase(num_pages, frame_list);
++	if (ret != num_pages)
++		XEN_ERROR("Failed to increase reservation for pages\n");
++
++	xenmem_reservation_va_mapping_update(num_pages, pages, frame_list);
+ 
+ 	if (obj->vaddr)
++#if defined(CONFIG_XT_CMA_HELPER)
++		xt_cma_dma_free_wc(dev, size, obj->vaddr, obj->dev_bus_addr);
++#else
+ 		dma_free_wc(dev, size, obj->vaddr, obj->dev_bus_addr);
++#endif
+ 
+ 	obj->vaddr = NULL;
+ 	obj->dev_bus_addr = 0;
+-- 
+2.34.1
+

@@ -1,0 +1,52 @@
+From ce97afd2b27e825ec0c872ef00437e56ae5eadc0 Mon Sep 17 00:00:00 2001
+Message-Id: <ce97afd2b27e825ec0c872ef00437e56ae5eadc0.1728389216.git.mykyta_poturai@epam.com>
+In-Reply-To: <bc35a1559ba18018db00e017ef9359f091274151.1728389216.git.mykyta_poturai@epam.com>
+References: <bc35a1559ba18018db00e017ef9359f091274151.1728389216.git.mykyta_poturai@epam.com>
+From: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Date: Tue, 27 Feb 2018 11:38:23 +0200
+Subject: [PATCH 08/22] Introduce PVRSRV_PVZIF_GNTTAB build option
+
+Newly added option will be used for choosing Grant Tables based mechanism
+for mapping Guest FW heap. The main idea of such mapping is to allow
+all heaps to get into the host domain's P2M table (and as the result
+into the IOMMU page table) automatically.
+
+Signed-off-by: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+---
+ build/linux/config/core.mk               | 3 +++
+ services/system/rogue/rgx_rcar/Kbuild.mk | 5 +++++
+ 2 files changed, 8 insertions(+)
+
+diff --git a/build/linux/config/core.mk b/build/linux/config/core.mk
+index 5c47891..035e4f8 100644
+--- a/build/linux/config/core.mk
++++ b/build/linux/config/core.mk
+@@ -1246,6 +1246,9 @@ $(eval $(call TunableBothConfigC,PVRSRV_ENABLE_CCCB_GROW,,\
+ This controls the feature that allows the Services client CCBs to grow_\
+ when they become full._\
+ ))
++$(eval $(call TunableKernelConfigMake,PVRSRV_PVZIF_GNTTAB,))
++$(eval $(call TunableKernelConfigC,PVRSRV_PVZIF_GNTTAB,,\
++Chooses Grant Tables based mechanism for mapping Guest FW heap))
+ 
+ $(eval $(call TunableBothConfigC,FIX_DUSTS_POW_ON_INIT,,\
+ Enable WA for power controllers that power up dusts by default._\
+diff --git a/services/system/rogue/rgx_rcar/Kbuild.mk b/services/system/rogue/rgx_rcar/Kbuild.mk
+index 9f02f41..8c920ca 100644
+--- a/services/system/rogue/rgx_rcar/Kbuild.mk
++++ b/services/system/rogue/rgx_rcar/Kbuild.mk
+@@ -56,6 +56,11 @@ $(PVRSRVKM_NAME)-y += \
+  services/system/rogue/common/env/xen/xen_front.o \
+  services/system/rogue/common/env/xen/xen_back.o \
+  services/system/rogue/common/vmm_type_xen.o
++ifeq ($(PVRSRV_PVZIF_GNTTAB),1)
++$(PVRSRVKM_NAME)-y += \
++ services/system/rogue/common/env/xen/xen_pvz_front_shbuf.o \
++ services/system/rogue/common/env/xen/xen_pvz_balloon.o
++endif
+ else
+ $(PVRSRVKM_NAME)-y += \
+  services/system/rogue/common/vmm_type_$(VMM_TYPE).o
+-- 
+2.34.1
+

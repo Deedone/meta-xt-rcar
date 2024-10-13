@@ -1,0 +1,288 @@
+From 10ff8c43d9034c8949cc722a8c4be4ec7cd46655 Mon Sep 17 00:00:00 2001
+Message-Id: <10ff8c43d9034c8949cc722a8c4be4ec7cd46655.1728809840.git.mykyta_poturai@epam.com>
+In-Reply-To: <df3786db26280c3b935a0e91d707a7c711e7fb11.1728809840.git.mykyta_poturai@epam.com>
+References: <df3786db26280c3b935a0e91d707a7c711e7fb11.1728809840.git.mykyta_poturai@epam.com>
+From: Mykyta Poturai <mykyta_poturai@epam.com>
+Date: Wed, 9 Oct 2024 10:51:26 +0300
+Subject: [PATCH] Fixes for volcanic architecture
+
+Signed-off-by: Mykyta Poturai <mykyta_poturai@epam.com>
+
+---
+ build/linux/config/core_volcanic.mk           |  4 +++
+ services/server/env/linux/Kbuild.mk           |  1 -
+ services/system/rogue/common/env/xen/pvzif.h  |  3 +--
+ .../system/rogue/common/env/xen/xen_back.c    | 25 ++++++++++---------
+ .../system/rogue/common/env/xen/xen_front.c   |  9 ++-----
+ .../system/rogue/common/env/xen/xen_front.h   |  5 ++--
+ .../common/env/xen/xen_pvz_front_shbuf.c      |  1 +
+ services/system/rogue/common/vmm_type_xen.c   |  9 +++----
+ services/system/volcanic/rgx_rcar/Kbuild.mk   | 20 ++++++++++++++-
+ 9 files changed, 46 insertions(+), 31 deletions(-)
+
+diff --git a/build/linux/config/core_volcanic.mk b/build/linux/config/core_volcanic.mk
+index 68fa594..4008632 100644
+--- a/build/linux/config/core_volcanic.mk
++++ b/build/linux/config/core_volcanic.mk
+@@ -944,6 +944,10 @@ else
+  RGX_NUM_DRIVERS_SUPPORTED ?= 1
+ endif
+ 
++$(eval $(call TunableKernelConfigMake,PVRSRV_PVZIF_GNTTAB,))
++$(eval $(call TunableKernelConfigC,PVRSRV_PVZIF_GNTTAB,,\
++Chooses Grant Tables based mechanism for mapping Guest FW heap))
++
+ ifeq ($(RGX_NUM_DRIVERS_SUPPORTED),0)
+  override RGX_NUM_DRIVERS_SUPPORTED := 1
+ endif
+diff --git a/services/server/env/linux/Kbuild.mk b/services/server/env/linux/Kbuild.mk
+index 6857502..8cd0637 100644
+--- a/services/server/env/linux/Kbuild.mk
++++ b/services/server/env/linux/Kbuild.mk
+@@ -132,7 +132,6 @@ $(PVRSRV_MODNAME)-y += \
+  services/server/common/vmm_pvz_server.o \
+  services/server/common/vz_vmm_pvz.o \
+  services/server/common/vz_vmm_vm.o \
+- services/system/$(PVR_ARCH)/common/vmm_type_$(VMM_TYPE).o
+  
+ ifeq ($(PVRSRV_SUPPORT_DYNAMIC_PHYSHEAPS),1)
+  $(PVRSRV_MODNAME)-y += \
+diff --git a/services/system/rogue/common/env/xen/pvzif.h b/services/system/rogue/common/env/xen/pvzif.h
+index 076de2e..38444a7 100644
+--- a/services/system/rogue/common/env/xen/pvzif.h
++++ b/services/system/rogue/common/env/xen/pvzif.h
+@@ -84,8 +84,7 @@
+ #define XENGSX_FIELD_RING_REF		"ring-ref"
+ #define XENGSX_FIELD_EVT_CHNL		"event-channel"
+ #define XENGSX_FIELD_OSID		"osid"
+-
+-#if defined(PVRSRV_PVZIF_GNTTAB)
++#ifdef PVRSRV_PVZIF_GNTTAB
+ struct xengsx_page_directory {
+ 	grant_ref_t gref_dir_next_page;
+ 	grant_ref_t gref[1]; /* Variable length */
+diff --git a/services/system/rogue/common/env/xen/xen_back.c b/services/system/rogue/common/env/xen/xen_back.c
+index 1e1481b..b24c594 100644
+--- a/services/system/rogue/common/env/xen/xen_back.c
++++ b/services/system/rogue/common/env/xen/xen_back.c
+@@ -66,18 +66,18 @@ struct xdrv_info {
+ static VMM_PVZ_CONNECTION *xen_back_pvz_connection;
+ 
+ /* this is used to translate OSID to domain ID */
+-domid_t vgpu_img_osid_to_domid[RGXFW_MAX_NUM_OS] = { VGSX_BAD_DOMAIN_ID };
++domid_t vgpu_img_osid_to_domid[RGXFW_MAX_NUM_OSIDS] = { VGSX_BAD_DOMAIN_ID };
+ 
+ domid_t vgpu_img_get_domid(int osid)
+ {
+-	if (osid >= RGXFW_MAX_NUM_OS)
++	if (osid >= RGXFW_MAX_NUM_OSIDS)
+ 		return VGSX_BAD_DOMAIN_ID;
+ 	return vgpu_img_osid_to_domid[osid];
+ }
+ 
+ static bool vgpu_img_set_domid(int osid, int domid)
+ {
+-	if (osid >= RGXFW_MAX_NUM_OS)
++	if (osid >= RGXFW_MAX_NUM_OSIDS)
+ 		return false;
+ 
+ 	if (vgpu_img_osid_to_domid[osid] != 0)
+@@ -89,7 +89,7 @@ static bool vgpu_img_set_domid(int osid, int domid)
+ 
+ static bool vgpu_img_reset_domid(int osid, int domid)
+ {
+-	if (osid >= RGXFW_MAX_NUM_OS)
++	if (osid >= RGXFW_MAX_NUM_OSIDS)
+ 		return false;
+ 
+ 	vgpu_img_osid_to_domid[osid] = domid;
+@@ -405,6 +405,8 @@ static void xdrv_do_op(struct work_struct *data)
+ 			/* Apply all sanity checks to /private copy/ of request. */
+ 			barrier();
+ 
++			req.dev_id = 0;
++
+ 			switch (req.operation) {
+ 			case XENGSX_OP_MAP_DEV_HEAP:
+ #if defined(PVRSRV_PVZIF_GNTTAB)
+@@ -419,7 +421,7 @@ static void xdrv_do_op(struct work_struct *data)
+ #endif
+ 				if (!ret) {
+ 					ret = xen_back_pvz_connection->sServerFuncTab.pfnMapDevPhysHeap(
+-						drv_info->osid, req.func_id, req.dev_id,
++						drv_info->osid, req.dev_id,
+ 						req.op.map_dev_heap.buffer_sz,
+ 						ui64PAddr);
+ 					if (ret == PVRSRV_OK)
+@@ -446,7 +448,7 @@ static void xdrv_do_op(struct work_struct *data)
+ 						vgpu_img_get_domid(drv_info->osid));
+ 				} else {
+ 					ret = xen_back_pvz_connection->sServerFuncTab.pfnUnmapDevPhysHeap(
+-						drv_info->osid, req.func_id, req.dev_id);
++						drv_info->osid, req.dev_id); 
+ #if defined(PVRSRV_PVZIF_GNTTAB)
+ 					if (xdrv_unmap_dev_heap(drv_info)) {
+ 						if (!ret)
+@@ -520,10 +522,10 @@ static int xdrv_fe_on_initialized(struct xdrv_info *drv_info)
+ 		return ret;
+ 	}
+ 
+-	if (osid > RGXFW_MAX_NUM_OS) {
++	if (osid > RGXFW_MAX_NUM_OSIDS) {
+ 		xenbus_dev_fatal(xb_dev, ret,
+ 			"OSID provided is out of range (%d > %d)",
+-			osid, RGXFW_MAX_NUM_OS);
++			osid, RGXFW_MAX_NUM_OSIDS);
+ 		return -EINVAL;
+ 	}
+ 
+@@ -583,13 +585,12 @@ static void xdrv_fe_on_disconnected(struct xdrv_info *drv_info)
+ 	/* unmap guest's FW heap if any */
+ 	if (drv_info->dev_id != VGSX_BAD_DEVICE_ID)
+ 		xen_back_pvz_connection->sServerFuncTab.pfnUnmapDevPhysHeap(
+-			drv_info->osid, PVZ_BRIDGE_UNMAPDEVICEPHYSHEAP,
+-			drv_info->dev_id);
++			drv_info->osid, drv_info->dev_id);
+ 	drv_info->dev_id = VGSX_BAD_DEVICE_ID;
+ 
+ 	if (drv_info->osid) {
+ 		xen_back_pvz_connection->sVmmFuncTab.pfnOnVmOffline(
+-			drv_info->osid);
++			drv_info->osid, 0);
+ #if defined(PVRSRV_PVZIF_GNTTAB)
+ 		xdrv_unmap_dev_heap(drv_info);
+ #endif
+@@ -655,7 +656,7 @@ static void xdrv_fe_on_changed(struct xenbus_device *xb_dev,
+ 		}
+ 
+ 		xen_back_pvz_connection->sVmmFuncTab.pfnOnVmOnline(
+-			drv_info->osid);
++			drv_info->osid, 0);
+ 		xenbus_switch_state(xb_dev, XenbusStateConnected);
+ 		break;
+ 	}
+diff --git a/services/system/rogue/common/env/xen/xen_front.c b/services/system/rogue/common/env/xen/xen_front.c
+index 0512c61..ceab8e8 100644
+--- a/services/system/rogue/common/env/xen/xen_front.c
++++ b/services/system/rogue/common/env/xen/xen_front.c
+@@ -462,8 +462,7 @@ void gsx_front_cleanup(void)
+ 	xenbus_unregister_driver(&xen_driver);
+ }
+ 
+-int gsx_front_map(uint32_t func_id, uint32_t dev_id,
+-	uint64_t size, uint64_t addr)
++int gsx_front_map(uint64_t size, uint64_t addr)
+ {
+ 	struct xdrv_info *drv_info = xdrv_get_drv_info();
+ 	struct xengsx_req *req;
+@@ -485,8 +484,6 @@ int gsx_front_map(uint32_t func_id, uint32_t dev_id,
+ 
+ 	spin_lock_irqsave(&drv_info->io_lock, flags);
+ 	req = be_prepare_req(drv_info, XENGSX_OP_MAP_DEV_HEAP);
+-	req->func_id = func_id;
+-	req->dev_id = dev_id;
+ #if defined(PVRSRV_PVZIF_GNTTAB)
+ 	req->op.map_dev_heap.gref_directory =
+ 			xen_pvz_front_shbuf_get_dir_start(drv_info->shbuf);
+@@ -520,7 +517,7 @@ fail:
+ 	return ret;
+ }
+ 
+-int gsx_front_unmap(uint32_t func_id, uint32_t dev_id)
++int gsx_front_unmap(void)
+ {
+ 	struct xdrv_info *drv_info = xdrv_get_drv_info();
+ 	struct xengsx_req *req;
+@@ -532,8 +529,6 @@ int gsx_front_unmap(uint32_t func_id, uint32_t dev_id)
+ 
+ 	spin_lock_irqsave(&drv_info->io_lock, flags);
+ 	req = be_prepare_req(drv_info, XENGSX_OP_UNMAP_DEV_HEAP);
+-	req->func_id = func_id;
+-	req->dev_id = dev_id;
+ 
+ 	ret = be_do_io(&drv_info->evt_chnl);
+ 	spin_unlock_irqrestore(&drv_info->io_lock, flags);
+diff --git a/services/system/rogue/common/env/xen/xen_front.h b/services/system/rogue/common/env/xen/xen_front.h
+index 6fb3d2e..d54f0a9 100644
+--- a/services/system/rogue/common/env/xen/xen_front.h
++++ b/services/system/rogue/common/env/xen/xen_front.h
+@@ -4,8 +4,7 @@
+ int gsx_front_init(void);
+ void gsx_front_cleanup(void);
+ 
+-int gsx_front_map(uint32_t func_id, uint32_t dev_id,
+-	uint64_t size, uint64_t addr);
+-int gsx_front_unmap(uint32_t func_id, uint32_t dev_id);
++int gsx_front_map(uint64_t size, uint64_t addr);
++int gsx_front_unmap(void);
+ 
+ #endif /* __XEN_FRONT_H__ */
+diff --git a/services/system/rogue/common/env/xen/xen_pvz_front_shbuf.c b/services/system/rogue/common/env/xen/xen_pvz_front_shbuf.c
+index 5ee4212..1027c98 100644
+--- a/services/system/rogue/common/env/xen/xen_pvz_front_shbuf.c
++++ b/services/system/rogue/common/env/xen/xen_pvz_front_shbuf.c
+@@ -23,6 +23,7 @@
+ 
+ #include "xen_debug.h"
+ #include "xen_pvz_front_shbuf.h"
++#include "pvzif.h"
+ 
+ grant_ref_t xen_pvz_front_shbuf_get_dir_start(struct xen_pvz_front_shbuf *buf)
+ {
+diff --git a/services/system/rogue/common/vmm_type_xen.c b/services/system/rogue/common/vmm_type_xen.c
+index 522e654..4b86927 100644
+--- a/services/system/rogue/common/vmm_type_xen.c
++++ b/services/system/rogue/common/vmm_type_xen.c
+@@ -78,16 +78,15 @@ static VMM_PVZ_CONNECTION gsXenVmmPvz;
+  */
+ 
+ static PVRSRV_ERROR
+-XenVmmMapDevPhysHeap(IMG_UINT32 ui32FuncID, IMG_UINT32 ui32DevID,
+-	IMG_UINT64 ui64Size, IMG_UINT64 ui64Addr)
++XenVmmMapDevPhysHeap(IMG_UINT64 ui64Size, IMG_UINT64 ui64Addr)
+ {
+-	return gsx_front_map(ui32FuncID, ui32DevID, ui64Size, ui64Addr);
++	return gsx_front_map(ui64Size, ui64Addr);
+ }
+ 
+ static PVRSRV_ERROR
+-XenVmmUnmapDevPhysHeap(IMG_UINT32 ui32FuncID, IMG_UINT32 ui32DevID)
++XenVmmUnmapDevPhysHeap(void)
+ {
+-	return gsx_front_unmap(ui32FuncID, ui32DevID);
++	return gsx_front_unmap();
+ }
+ 
+ /*
+diff --git a/services/system/volcanic/rgx_rcar/Kbuild.mk b/services/system/volcanic/rgx_rcar/Kbuild.mk
+index efec9c5..850bfb5 100644
+--- a/services/system/volcanic/rgx_rcar/Kbuild.mk
++++ b/services/system/volcanic/rgx_rcar/Kbuild.mk
+@@ -46,8 +46,26 @@ $(PVRSRVKM_NAME)-y += services/system/volcanic/$(PVR_SYSTEM)/sysconfig.o \
+  services/server/common/vmm_pvz_server.o \
+  services/server/common/vz_vmm_pvz.o \
+  services/server/common/vz_vmm_vm.o \
+- services/system/volcanic/common/vmm_type_$(VMM_TYPE).o
+ 
+ ifeq ($(SUPPORT_ION),1)
+ $(PVRSRVKM_NAME)-y += services/system/common/env/linux/ion_support_generic.o
+ endif
++
++ifeq ($(shell test $(PVRSRV_VZ_NUM_OSID) -gt 1; echo $$?),0)
++ ccflags-y += -I$(TOP)/services/system/rogue/common/env/xen
++endif
++
++ifeq ($(shell test $(PVRSRV_VZ_NUM_OSID) -gt 1; echo $$?),0)
++$(PVRSRVKM_NAME)-y += \
++ services/system/rogue/common/env/xen/xen_front.o \
++ services/system/rogue/common/env/xen/xen_back.o \
++ services/system/rogue/common/vmm_type_xen.o
++ifeq ($(PVRSRV_PVZIF_GNTTAB),1)
++$(PVRSRVKM_NAME)-y += \
++ services/system/rogue/common/env/xen/xen_pvz_front_shbuf.o \
++ services/system/rogue/common/env/xen/xen_pvz_balloon.o
++endif
++else
++$(PVRSRVKM_NAME)-y += \
++ services/system/rogue/common/vmm_type_$(VMM_TYPE).o
++endif

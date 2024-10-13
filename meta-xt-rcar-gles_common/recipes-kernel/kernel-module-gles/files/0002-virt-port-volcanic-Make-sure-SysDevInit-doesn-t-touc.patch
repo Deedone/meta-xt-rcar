@@ -1,0 +1,76 @@
+From 35e160678a995e65701aafe631dcc5d3588d0812 Mon Sep 17 00:00:00 2001
+Message-Id: <35e160678a995e65701aafe631dcc5d3588d0812.1728817042.git.mykyta_poturai@epam.com>
+In-Reply-To: <d69aa3acbe5906f79cbb0abc1ba011e43ae8a664.1728817042.git.mykyta_poturai@epam.com>
+References: <d69aa3acbe5906f79cbb0abc1ba011e43ae8a664.1728817042.git.mykyta_poturai@epam.com>
+From: Mykyta Poturai <mykyta_poturai@epam.com>
+Date: Sun, 13 Oct 2024 13:56:42 +0300
+Subject: [PATCH] virt/port/volcanic: Make sure SysDevInit doesn't touch HW for
+ Guest
+
+Guest mode driver must not touch HW.
+
+Signed-off-by: Mykyta Poturai <mykyta_poturai@epam.com>
+---
+ services/system/volcanic/rgx_rcar/sysconfig.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/services/system/volcanic/rgx_rcar/sysconfig.c b/services/system/volcanic/rgx_rcar/sysconfig.c
+index 6c219c3..de6c5d3 100644
+--- a/services/system/volcanic/rgx_rcar/sysconfig.c
++++ b/services/system/volcanic/rgx_rcar/sysconfig.c
+@@ -285,6 +285,7 @@ static IMG_UINT32 RGX_3DGE_ClockFreqGet(IMG_HANDLE hSysData)
+ {
+ 	SYS_DATA *psSysData = (SYS_DATA *)hSysData;
+ 	IMG_UINT32 rate;
++	PVRSRV_VZ_RET_IF_MODE(GUEST, RGX_3DGE_CORE_CLOCK_SPEED);
+ 
+ 	rate = (IMG_UINT32)clk_get_rate(psSysData->psRGX_FCK);
+ 	if (rate <= 0)
+@@ -351,6 +352,7 @@ static PVRSRV_ERROR InitClocks(SYS_DATA *psSysData)
+ {
+ 	struct platform_device *pdev = psSysData->pdev;
+ 
++	PVRSRV_VZ_RET_IF_MODE(GUEST, PVRSRV_OK);
+ 	psSysData->psRGX_FCK = devm_clk_get(&pdev->dev, NULL);
+ 	if (IS_ERR(psSysData->psRGX_FCK))
+ 	{
+@@ -366,6 +368,7 @@ static PVRSRV_ERROR InitClocks(SYS_DATA *psSysData)
+ static PVRSRV_ERROR DeinitClocks(SYS_DATA *psSysData)
+ {
+ 	struct platform_device *pdev = psSysData->pdev;
++	PVRSRV_VZ_RET_IF_MODE(GUEST, PVRSRV_OK);
+ 
+ 	if (psSysData->psRGX_FCK)
+ 	{
+@@ -383,6 +386,7 @@ static PVRSRV_ERROR EnableClocks(void)
+ 	IMG_UINT32 ui32CoreClockSpeed = RGX_3DGE_CORE_CLOCK_SPEED;
+ 	int res;
+ 
++	PVRSRV_VZ_RET_IF_MODE(GUEST, PVRSRV_OK);
+ 	if (gpsSysData->psRGXTimingInfo && gpsSysData->psRGXTimingInfo->ui32CoreClockSpeed)
+ 	{
+ 		ui32CoreClockSpeed = gpsSysData->psRGXTimingInfo->ui32CoreClockSpeed;
+@@ -406,6 +410,7 @@ PVRSRV_ERROR DisableClocks(void)
+ 	struct platform_device *pdev = gpsSysData->pdev;
+ 	int res;
+ 
++	PVRSRV_VZ_RET_IF_MODE(GUEST, PVRSRV_OK);
+ 	res = pm_runtime_put_sync(&pdev->dev);
+ 	if (res < 0)
+ 	{
+@@ -421,6 +426,7 @@ static PVRSRV_ERROR PMRuntimeRegister(void)
+ 	struct platform_device *pdev = gpsSysData->pdev;
+ 	int res;
+ 
++	PVRSRV_VZ_RET_IF_MODE(GUEST, PVRSRV_OK);
+ 	pm_runtime_enable(&pdev->dev);
+ 
+ 	res = pm_runtime_get_sync(&pdev->dev);
+@@ -438,6 +444,7 @@ static PVRSRV_ERROR PMRuntimeUnregister(void)
+ 	struct platform_device *pdev = gpsSysData->pdev;
+ 	int res;
+ 
++	PVRSRV_VZ_RET_IF_MODE(GUEST, PVRSRV_OK);
+ 	res = pm_runtime_put_sync(&pdev->dev);
+ 	if (res < 0)
+ 	{

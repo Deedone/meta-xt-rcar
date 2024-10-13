@@ -1,0 +1,319 @@
+From bea03a3d7a08a5a132fcf2649f70c5f50fd415e2 Mon Sep 17 00:00:00 2001
+Message-Id: <bea03a3d7a08a5a132fcf2649f70c5f50fd415e2.1728389216.git.mykyta_poturai@epam.com>
+In-Reply-To: <bc35a1559ba18018db00e017ef9359f091274151.1728389216.git.mykyta_poturai@epam.com>
+References: <bc35a1559ba18018db00e017ef9359f091274151.1728389216.git.mykyta_poturai@epam.com>
+From: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Date: Mon, 26 Feb 2018 20:46:47 +0200
+Subject: [PATCH 07/22] Add support to share a buffer via grefs
+
+The ported from Xen PVDRM support will be used by Grant Tables
+based mechanism for sharing Guest FW heap on the frontend side.
+
+Signed-off-by: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+---
+ .../common/env/xen/xen_pvz_front_shbuf.c      | 224 ++++++++++++++++++
+ .../common/env/xen/xen_pvz_front_shbuf.h      |  61 +++++
+ 2 files changed, 285 insertions(+)
+ create mode 100644 services/system/rogue/common/env/xen/xen_pvz_front_shbuf.c
+ create mode 100644 services/system/rogue/common/env/xen/xen_pvz_front_shbuf.h
+
+diff --git a/services/system/rogue/common/env/xen/xen_pvz_front_shbuf.c b/services/system/rogue/common/env/xen/xen_pvz_front_shbuf.c
+new file mode 100644
+index 0000000..5ee4212
+--- /dev/null
++++ b/services/system/rogue/common/env/xen/xen_pvz_front_shbuf.c
+@@ -0,0 +1,224 @@
++/*
++ *   This program is free software; you can redistribute it and/or modify
++ *   it under the terms of the GNU General Public License as published by
++ *   the Free Software Foundation; either version 2 of the License, or
++ *   (at your option) any later version.
++ *
++ *   This program is distributed in the hope that it will be useful,
++ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *   GNU General Public License for more details.
++ *
++ * Based on xen_drm_front_shbuf.c (Xen para-virtual DRM device)
++ *
++ * Copyright (C) 2016-2018 EPAM Systems Inc.
++ *
++ * Author: Oleksandr Andrushchenko <oleksandr_andrushchenko@epam.com>
++ */
++
++#include <xen/events.h>
++#include <xen/grant_table.h>
++#include <xen/xen.h>
++#include <xen/xenbus.h>
++
++#include "xen_debug.h"
++#include "xen_pvz_front_shbuf.h"
++
++grant_ref_t xen_pvz_front_shbuf_get_dir_start(struct xen_pvz_front_shbuf *buf)
++{
++	if (!buf->grefs)
++		return GRANT_INVALID_REF;
++
++	return buf->grefs[0];
++}
++
++void xen_pvz_front_shbuf_free(struct xen_pvz_front_shbuf *buf)
++{
++	if (buf->grefs) {
++		int i;
++
++		for (i = 0; i < buf->num_grefs; i++)
++			if (buf->grefs[i] != GRANT_INVALID_REF)
++				gnttab_end_foreign_access(buf->grefs[i],
++					0, 0UL);
++		kfree(buf->grefs);
++	}
++	if (buf->directory)
++		kfree(buf->directory);
++	if (buf->addr && buf->pages)
++		kfree(buf->pages);
++	kfree(buf);
++}
++
++/*
++ * number of grefs a page can hold with respect to the
++ * struct xengsx_page_directory header
++ */
++#define XEN_GSX_NUM_GREFS_PER_PAGE ((PAGE_SIZE - \
++	offsetof(struct xengsx_page_directory, gref)) / \
++	sizeof(grant_ref_t))
++
++static int get_num_pages_dir(struct xen_pvz_front_shbuf *buf)
++{
++	/* number of pages the page directory consumes itself */
++	return DIV_ROUND_UP(buf->num_pages, XEN_GSX_NUM_GREFS_PER_PAGE);
++}
++
++static void calc_num_grefs(struct xen_pvz_front_shbuf *buf)
++{
++	/*
++	 * number of pages the page directory consumes itself
++	 * plus grefs for the buffer pages
++	 */
++	buf->num_grefs = get_num_pages_dir(buf) + buf->num_pages;
++}
++
++#define xen_page_to_vaddr(page) \
++		((phys_addr_t)pfn_to_kaddr(page_to_xen_pfn(page)))
++
++static void fill_page_dir(struct xen_pvz_front_shbuf *buf)
++{
++	unsigned char *ptr;
++	int cur_gref, grefs_left, to_copy, i, num_pages_dir;
++
++	ptr = buf->directory;
++	num_pages_dir = get_num_pages_dir(buf);
++
++	/*
++	 * while copying, skip grefs at start, they are for pages
++	 * granted for the page directory itself
++	 */
++	cur_gref = num_pages_dir;
++	grefs_left = buf->num_pages;
++	for (i = 0; i < num_pages_dir; i++) {
++		struct xengsx_page_directory *page_dir =
++				(struct xengsx_page_directory *)ptr;
++
++		if (grefs_left <= XEN_GSX_NUM_GREFS_PER_PAGE) {
++			to_copy = grefs_left;
++			page_dir->gref_dir_next_page = GRANT_INVALID_REF;
++		} else {
++			to_copy = XEN_GSX_NUM_GREFS_PER_PAGE;
++			page_dir->gref_dir_next_page = buf->grefs[i + 1];
++		}
++		memcpy(&page_dir->gref, &buf->grefs[cur_gref],
++				to_copy * sizeof(grant_ref_t));
++		ptr += PAGE_SIZE;
++		grefs_left -= to_copy;
++		cur_gref += to_copy;
++	}
++}
++
++static int grant_refs_for_buffer(struct xen_pvz_front_shbuf *buf,
++		grant_ref_t *priv_gref_head, int gref_idx)
++{
++	int i, cur_ref, otherend_id;
++
++	otherend_id = buf->xb_dev->otherend_id;
++	for (i = 0; i < buf->num_pages; i++) {
++		cur_ref = gnttab_claim_grant_reference(priv_gref_head);
++		if (cur_ref < 0)
++			return cur_ref;
++		gnttab_grant_foreign_access_ref(cur_ref, otherend_id,
++				xen_page_to_gfn(buf->pages[i]), 0);
++		buf->grefs[gref_idx++] = cur_ref;
++	}
++	return 0;
++}
++
++static int grant_references(struct xen_pvz_front_shbuf *buf)
++{
++	grant_ref_t priv_gref_head;
++	int ret, i, j, cur_ref;
++	int otherend_id, num_pages_dir;
++
++	ret = gnttab_alloc_grant_references(buf->num_grefs, &priv_gref_head);
++	if (ret < 0) {
++		XEN_ERROR("Cannot allocate grant references\n");
++		return ret;
++	}
++	otherend_id = buf->xb_dev->otherend_id;
++	j = 0;
++	num_pages_dir = get_num_pages_dir(buf);
++	for (i = 0; i < num_pages_dir; i++) {
++		unsigned long frame;
++
++		cur_ref = gnttab_claim_grant_reference(&priv_gref_head);
++		if (cur_ref < 0)
++			return cur_ref;
++
++		frame = xen_page_to_gfn(virt_to_page(buf->directory +
++				PAGE_SIZE * i));
++		gnttab_grant_foreign_access_ref(cur_ref, otherend_id,
++				frame, 0);
++		buf->grefs[j++] = cur_ref;
++	}
++
++	ret = grant_refs_for_buffer(buf, &priv_gref_head, j);
++	if (ret)
++		return ret;
++
++	gnttab_free_grant_references(priv_gref_head);
++	return 0;
++}
++
++static int alloc_storage(struct xen_pvz_front_shbuf *buf)
++{
++	if (buf->addr) {
++		int i;
++
++		buf->pages = kcalloc(buf->num_pages, sizeof(*buf->pages), GFP_KERNEL);
++		if (!buf->pages)
++			return -ENOMEM;
++
++		for (i = 0; i < buf->num_pages; i++)
++			buf->pages[i] = phys_to_page(buf->addr + i * PAGE_SIZE);
++	}
++
++	buf->grefs = kcalloc(buf->num_grefs, sizeof(*buf->grefs), GFP_KERNEL);
++	if (!buf->grefs)
++		return -ENOMEM;
++
++	buf->directory = kcalloc(get_num_pages_dir(buf), PAGE_SIZE, GFP_KERNEL);
++	if (!buf->directory)
++		return -ENOMEM;
++
++	return 0;
++}
++
++struct xen_pvz_front_shbuf *xen_pvz_front_shbuf_alloc(
++		struct xen_pvz_front_shbuf_cfg *cfg)
++{
++	struct xen_pvz_front_shbuf *buf;
++	int ret;
++
++	/* either pages or base address, not both */
++	BUG_ON(cfg->pages && cfg->addr);
++
++	buf = kzalloc(sizeof(*buf), GFP_KERNEL);
++	if (!buf)
++		return NULL;
++
++	buf->xb_dev = cfg->xb_dev;
++	buf->num_pages = DIV_ROUND_UP(cfg->size, PAGE_SIZE);
++	buf->pages = cfg->pages;
++	buf->addr = cfg->addr;
++
++	calc_num_grefs(buf);
++
++	ret = alloc_storage(buf);
++	if (ret)
++		goto fail;
++
++	ret = grant_references(buf);
++	if (ret)
++		goto fail;
++
++	fill_page_dir(buf);
++
++	return buf;
++
++fail:
++	xen_pvz_front_shbuf_free(buf);
++	return ERR_PTR(ret);
++}
+diff --git a/services/system/rogue/common/env/xen/xen_pvz_front_shbuf.h b/services/system/rogue/common/env/xen/xen_pvz_front_shbuf.h
+new file mode 100644
+index 0000000..d4dfc96
+--- /dev/null
++++ b/services/system/rogue/common/env/xen/xen_pvz_front_shbuf.h
+@@ -0,0 +1,61 @@
++/*
++ *   This program is free software; you can redistribute it and/or modify
++ *   it under the terms of the GNU General Public License as published by
++ *   the Free Software Foundation; either version 2 of the License, or
++ *   (at your option) any later version.
++ *
++ *   This program is distributed in the hope that it will be useful,
++ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *   GNU General Public License for more details.
++ *
++ * Based on xen_drm_front_shbuf.h (Xen para-virtual DRM device)
++ *
++ * Copyright (C) 2016-2018 EPAM Systems Inc.
++ *
++ * Author: Oleksandr Andrushchenko <oleksandr_andrushchenko@epam.com>
++ */
++
++#ifndef __XEN_PVZ_FRONT_SHBUF_H_
++#define __XEN_PVZ_FRONT_SHBUF_H_
++
++#include <linux/kernel.h>
++#include <xen/grant_table.h>
++
++struct xen_pvz_front_shbuf {
++	/*
++	 * number of references granted for the backend use:
++	 *  - for allocated/imported buffers this holds number of grant
++	 *    references for the page directory and pages of the buffer
++	 */
++	int num_grefs;
++	grant_ref_t *grefs;
++	unsigned char *directory;
++
++	/*
++	 * there are 2 ways to provide backing storage for this shared buffer:
++	 * either pages or base address. if buffer created from address then we own
++	 * the pages and must free those ourselves on closure
++	 */
++	int num_pages;
++	struct page **pages;
++	uint64_t addr;
++
++	struct xenbus_device *xb_dev;
++};
++
++struct xen_pvz_front_shbuf_cfg {
++	struct xenbus_device *xb_dev;
++	size_t size;
++	uint64_t addr;
++	struct page **pages;
++};
++
++struct xen_pvz_front_shbuf *xen_pvz_front_shbuf_alloc(
++		struct xen_pvz_front_shbuf_cfg *cfg);
++
++grant_ref_t xen_pvz_front_shbuf_get_dir_start(struct xen_pvz_front_shbuf *buf);
++
++void xen_pvz_front_shbuf_free(struct xen_pvz_front_shbuf *buf);
++
++#endif /* __XEN_PVZ_FRONT_SHBUF_H_ */
+-- 
+2.34.1
+

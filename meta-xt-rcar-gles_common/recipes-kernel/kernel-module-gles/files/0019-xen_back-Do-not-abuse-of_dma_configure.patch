@@ -1,0 +1,51 @@
+From 11a3698d8e760b783b17c81bb5786f93d435f87a Mon Sep 17 00:00:00 2001
+Message-Id: <11a3698d8e760b783b17c81bb5786f93d435f87a.1728389216.git.mykyta_poturai@epam.com>
+In-Reply-To: <bc35a1559ba18018db00e017ef9359f091274151.1728389216.git.mykyta_poturai@epam.com>
+References: <bc35a1559ba18018db00e017ef9359f091274151.1728389216.git.mykyta_poturai@epam.com>
+From: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Date: Mon, 22 Nov 2021 15:02:33 +0200
+Subject: [PATCH 19/22] xen_back: Do not abuse of_dma_configure()
+
+Update out-of-tree driver according to the upstream commit:
+ee7f522 xen: Stop abusing DT of_dma_configure API
+
+Signed-off-by: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+---
+ services/system/rogue/common/env/xen/xen_back.c | 13 ++-----------
+ 1 file changed, 2 insertions(+), 11 deletions(-)
+
+diff --git a/services/system/rogue/common/env/xen/xen_back.c b/services/system/rogue/common/env/xen/xen_back.c
+index 26304ca..1e1481b 100644
+--- a/services/system/rogue/common/env/xen/xen_back.c
++++ b/services/system/rogue/common/env/xen/xen_back.c
+@@ -28,7 +28,6 @@
+ #include "xen_debug.h"
+ 
+ #if defined(PVRSRV_PVZIF_GNTTAB)
+-#include <linux/of_device.h>
+ #include "xen_pvz_balloon.h"
+ #endif
+ 
+@@ -676,17 +675,9 @@ static int xdrv_probe(struct xenbus_device *xb_dev,
+ 
+ 	drv_info->xb_dev = xb_dev;
+ #if defined(PVRSRV_PVZIF_GNTTAB)
+-	/*
+-	 * The device is not spawn from a device tree, so arch_setup_dma_ops
+-	 * is not called, thus leaving the device with dummy DMA ops.
+-	 * This makes the device return error on dma_alloc* allocations, which
+-	 * is not correct: to fix this call of_dma_configure() with a NULL
+-	 * node to set default DMA ops.
+-	 */
+-	xb_dev->dev.coherent_dma_mask = DMA_BIT_MASK(40);
+-	ret = of_dma_configure(&xb_dev->dev, NULL, true);
++	ret = dma_coerce_mask_and_coherent(&xb_dev->dev, DMA_BIT_MASK(40));
+ 	if (ret < 0) {
+-		xenbus_dev_fatal(xb_dev, ret, "setting up DMA ops");
++		xenbus_dev_fatal(xb_dev, ret, "setting up DMA mask");
+ 		return ret;
+ 	}
+ #endif
+-- 
+2.34.1
+

@@ -1,0 +1,208 @@
+From 1001ef6102637cb3b0478ae4f526cafa791705c1 Mon Sep 17 00:00:00 2001
+Message-Id: <1001ef6102637cb3b0478ae4f526cafa791705c1.1728389216.git.mykyta_poturai@epam.com>
+In-Reply-To: <bc35a1559ba18018db00e017ef9359f091274151.1728389216.git.mykyta_poturai@epam.com>
+References: <bc35a1559ba18018db00e017ef9359f091274151.1728389216.git.mykyta_poturai@epam.com>
+From: Oleksandr Andrushchenko <oleksandr_andrushchenko@epam.com>
+Date: Wed, 13 Sep 2017 11:18:25 +0300
+Subject: [PATCH 02/22] Add para-virtualized GSX protocol
+
+Add protocol for data exchange between Xen front and back drivers.
+
+Signed-off-by: Oleksandr Andrushchenko <oleksandr_andrushchenko@epam.com>
+Signed-off-by: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+---
+ services/system/rogue/common/env/xen/pvzif.h  | 120 ++++++++++++++++++
+ .../system/rogue/common/env/xen/xen_back.c    |   3 +-
+ .../system/rogue/common/env/xen/xen_debug.h   |   4 +-
+ .../system/rogue/common/env/xen/xen_front.c   |   3 +-
+ 4 files changed, 127 insertions(+), 3 deletions(-)
+ create mode 100644 services/system/rogue/common/env/xen/pvzif.h
+
+diff --git a/services/system/rogue/common/env/xen/pvzif.h b/services/system/rogue/common/env/xen/pvzif.h
+new file mode 100644
+index 0000000..8b1c4c6
+--- /dev/null
++++ b/services/system/rogue/common/env/xen/pvzif.h
+@@ -0,0 +1,120 @@
++/******************************************************************************
++ * pvzif.h
++ *
++ * Unified GSX para-virtualization I/O interface for Xen guest OSes.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to
++ * deal in the Software without restriction, including without limitation the
++ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
++ * sell copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++ * DEALINGS IN THE SOFTWARE.
++ *
++ * Copyright (C) 2017 EPAM Systems Inc.
++ *
++ * Authors: Oleksandr Andrushchenko <oleksandr_andrushchenko@epam.com>
++ */
++
++#ifndef __XEN_PUBLIC_IO_PVZIF_H__
++#define __XEN_PUBLIC_IO_PVZIF_H__
++
++#include "xen/interface/io/ring.h"
++#include "xen/interface/grant_table.h"
++
++/*
++ ******************************************************************************
++ *                        Example configuration
++ ******************************************************************************
++ *
++ * This is an example of backend and frontend configuration:
++ *
++ *--------------------------------- Backend -----------------------------------
++ *
++ * /local/domain/0/backend/vgsx/1/0/frontend-id = "1"
++ * /local/domain/0/backend/vgsx/1/0/frontend = "/local/domain/1/device/vgsx/0"
++ * /local/domain/0/backend/vgsx/1/0/state = "4"
++ *
++ *--------------------------------- Frontend ----------------------------------
++ *
++ * /local/domain/1/device/vgsx/0/backend-id = "0"
++ * /local/domain/1/device/vgsx/0/backend = "/local/domain/0/backend/vgsx/1/0"
++ * /local/domain/1/device/vgsx/0/state = "4"
++ *
++ *----------------------------------- Guest -----------------------------------
++ *
++ * /local/domain/1/device/vgsx/0/ring-ref = "386"
++ * /local/domain/1/device/vgsx/0/event-channel = "15"
++ * /local/domain/1/device/vgsx/0/osid = "1"
++ */
++
++/*
++ ******************************************************************************
++ *                             REQUEST CODES
++ ******************************************************************************
++ */
++#define XENGSX_OP_MAP_DEV_HEAP		0
++#define XENGSX_OP_UNMAP_DEV_HEAP	1
++
++/*
++ ******************************************************************************
++ *               XENSTORE FIELD AND PATH NAME STRINGS, HELPERS
++ ******************************************************************************
++ */
++#define XENGSX_DRIVER_NAME		"vgsx"
++
++/* Field names */
++#define XENGSX_FIELD_RING_REF		"ring-ref"
++#define XENGSX_FIELD_EVT_CHNL		"event-channel"
++#define XENGSX_FIELD_OSID		"osid"
++
++/*
++ * Map Guest FW heap
++ */
++struct xengsx_map_dev_heap_req {
++	/* IPA address of the Guest FW heap start */
++	uint64_t ipa;
++	/* size of the heap, bytes */
++	uint64_t buffer_sz;
++};
++
++struct xengsx_req {
++	/* sequential request ID - echoed back in response */
++	uint16_t id;
++	/* operation ID XENGSX_OP_XXX */
++	uint8_t operation;
++	uint8_t reserved0;
++	/* func_id/dev_id as passed by the PVR bridge */
++	uint32_t func_id;
++	uint32_t dev_id;
++	uint8_t reserved1[4];
++	union {
++		struct xengsx_map_dev_heap_req map_dev_heap;
++		uint8_t reserved[12];
++	} op;
++};
++
++struct xengsx_resp {
++	/* sequential request ID - echoed back in response */
++	uint16_t id;
++	/* echoed back from the request */
++	uint8_t operation;
++	uint8_t reserved;
++	/* status of the operation PVR_XXX */
++	int32_t status;
++	uint8_t reserved1[24];
++};
++
++DEFINE_RING_TYPES(xen_gsxif, struct xengsx_req, struct xengsx_resp);
++
++#endif /* __XEN_PUBLIC_IO_PVZIF_H__ */
+diff --git a/services/system/rogue/common/env/xen/xen_back.c b/services/system/rogue/common/env/xen/xen_back.c
+index 6fa8f4d..412c119 100644
+--- a/services/system/rogue/common/env/xen/xen_back.c
++++ b/services/system/rogue/common/env/xen/xen_back.c
+@@ -21,6 +21,7 @@
+ 
+ #include "vmm_impl.h"
+ 
++#include "pvzif.h"
+ #include "xen_debug.h"
+ 
+ static void xdrv_fe_on_changed(struct xenbus_device *xb_dev,
+@@ -40,7 +41,7 @@ static int xdrv_remove(struct xenbus_device *xb_dev)
+ }
+ 
+ static const struct xenbus_device_id xdrv_ids[] = {
+-	{ "vgsx" },
++	{ XENGSX_DRIVER_NAME },
+ 	{ "" }
+ };
+ 
+diff --git a/services/system/rogue/common/env/xen/xen_debug.h b/services/system/rogue/common/env/xen/xen_debug.h
+index 4294b8b..2231de4 100644
+--- a/services/system/rogue/common/env/xen/xen_debug.h
++++ b/services/system/rogue/common/env/xen/xen_debug.h
+@@ -1,9 +1,11 @@
+ #ifndef __XEN_DEBUG_H__
+ #define __XEN_DEBUG_H__
+ 
++#include "pvzif.h"
++
+ #define XEN_LOG(level, fmt, ...)						\
+ 	do {									\
+-		printk(KERN_##level "vgsx:(%s:%d): " fmt "\n",	\
++		printk(KERN_##level XENGSX_DRIVER_NAME ":(%s:%d): " fmt "\n",	\
+ 				__FUNCTION__, __LINE__ , ## __VA_ARGS__);	\
+ 	} while (0)
+ 
+diff --git a/services/system/rogue/common/env/xen/xen_front.c b/services/system/rogue/common/env/xen/xen_front.c
+index a9c1356..4716e09 100644
+--- a/services/system/rogue/common/env/xen/xen_front.c
++++ b/services/system/rogue/common/env/xen/xen_front.c
+@@ -19,6 +19,7 @@
+ #include <xen/xen.h>
+ #include <xen/xenbus.h>
+ 
++#include "pvzif.h"
+ #include "xen_debug.h"
+ 
+ static void xdrv_be_on_changed(struct xenbus_device *xb_dev,
+@@ -38,7 +39,7 @@ static int xdrv_remove(struct xenbus_device *xb_dev)
+ }
+ 
+ static const struct xenbus_device_id xdrv_ids[] = {
+-	{ "vgsx" },
++	{ XENGSX_DRIVER_NAME },
+ 	{ "" }
+ };
+ 
+-- 
+2.34.1
+

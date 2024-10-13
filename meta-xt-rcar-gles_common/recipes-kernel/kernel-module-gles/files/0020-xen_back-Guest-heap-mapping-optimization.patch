@@ -1,0 +1,102 @@
+From 88f013b406b615d3826851d5ff05f8e62f176ec9 Mon Sep 17 00:00:00 2001
+Message-Id: <88f013b406b615d3826851d5ff05f8e62f176ec9.1728389216.git.mykyta_poturai@epam.com>
+In-Reply-To: <bc35a1559ba18018db00e017ef9359f091274151.1728389216.git.mykyta_poturai@epam.com>
+References: <bc35a1559ba18018db00e017ef9359f091274151.1728389216.git.mykyta_poturai@epam.com>
+From: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Date: Mon, 22 Nov 2021 20:25:59 +0200
+Subject: [PATCH 20/22] xen_back: Guest heap mapping optimization
+
+Depends on Linux's CONFIG_XEN_UNPOPULATED_ALLOC. If enabled then
+the extended regions will be used to map the guest heap into via
+xen_alloc_unpopulated_contiguous_pages() instead of ballooning
+out real RAM pages (wasting domain memory). This also avoids
+superpages shattering in Xen P2M when establishing stage-2 mapping
+(GFN <-> MFN) for the guest heap(s).
+
+Signed-off-by: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+---
+ .../rogue/common/env/xen/xen_pvz_balloon.c    | 45 +++++++++++++++++--
+ .../rogue/common/env/xen/xen_pvz_balloon.h    |  2 +
+ 2 files changed, 44 insertions(+), 3 deletions(-)
+
+diff --git a/services/system/rogue/common/env/xen/xen_pvz_balloon.c b/services/system/rogue/common/env/xen/xen_pvz_balloon.c
+index c29cb8a..391f688 100644
+--- a/services/system/rogue/common/env/xen/xen_pvz_balloon.c
++++ b/services/system/rogue/common/env/xen/xen_pvz_balloon.c
+@@ -22,13 +22,51 @@
+ #include <xen/mem-reservation.h>
+ #include <xen/grant_table.h>
+ 
++#include "xen_debug.h"
++#include "xen_pvz_balloon.h"
++
++#if defined(CONFIG_XEN_UNPOPULATED_ALLOC)
++
++int xen_pvz_ballooned_pages_alloc(struct device *dev,
++		struct xen_pvz_balloon *obj, int num_pages, struct page **pages)
++{
++	int ret;
++
++	ret = xen_alloc_unpopulated_contiguous_pages(dev, num_pages, pages);
++	if (ret < 0) {
++		XEN_ERROR("Cannot allocate %u unpopulated contiguous pages: %d\n",
++				num_pages, ret);
++		return ret;
++	}
++
++	obj->dev_bus_addr = page_to_phys(pages[0]);
++
++	ret = gnttab_pages_set_private(num_pages, pages);
++	if (ret < 0) {
++		xen_pvz_ballooned_pages_free(dev, obj, num_pages, pages);
++		return ret;
++	}
++
++	return 0;
++}
++
++void xen_pvz_ballooned_pages_free(struct device *dev,
++		struct xen_pvz_balloon *obj, int num_pages, struct page **pages)
++{
++	if (!pages || !obj->dev_bus_addr)
++		return;
++
++	gnttab_pages_clear_private(num_pages, pages);
++	xen_free_unpopulated_contiguous_pages(dev, num_pages, pages);
++
++	obj->dev_bus_addr = 0;
++}
++#else
++
+ #if defined(CONFIG_XT_CMA_HELPER)
+ #include <xen/xt_cma_helper.h>
+ #endif
+ 
+-#include "xen_debug.h"
+-#include "xen_pvz_balloon.h"
+-
+ int xen_pvz_ballooned_pages_alloc(struct device *dev,
+ 		struct xen_pvz_balloon *obj, int num_pages, struct page **pages)
+ {
+@@ -132,3 +170,4 @@ void xen_pvz_ballooned_pages_free(struct device *dev,
+ 	obj->dev_bus_addr = 0;
+ 	kfree(frame_list);
+ }
++#endif
+diff --git a/services/system/rogue/common/env/xen/xen_pvz_balloon.h b/services/system/rogue/common/env/xen/xen_pvz_balloon.h
+index aeb9e79..411e2e5 100644
+--- a/services/system/rogue/common/env/xen/xen_pvz_balloon.h
++++ b/services/system/rogue/common/env/xen/xen_pvz_balloon.h
+@@ -22,7 +22,9 @@
+ #include <linux/types.h>
+ 
+ struct xen_pvz_balloon {
++#if !defined(CONFIG_XEN_UNPOPULATED_ALLOC)
+ 	void *vaddr;
++#endif
+ 	dma_addr_t dev_bus_addr;
+ };
+ 
+-- 
+2.34.1
+

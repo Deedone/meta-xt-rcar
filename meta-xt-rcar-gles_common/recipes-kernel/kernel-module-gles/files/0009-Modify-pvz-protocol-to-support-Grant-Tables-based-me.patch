@@ -1,0 +1,61 @@
+From b5b24ab21ca9f96c2541fe8cffb24765c06224a9 Mon Sep 17 00:00:00 2001
+Message-Id: <b5b24ab21ca9f96c2541fe8cffb24765c06224a9.1728389216.git.mykyta_poturai@epam.com>
+In-Reply-To: <bc35a1559ba18018db00e017ef9359f091274151.1728389216.git.mykyta_poturai@epam.com>
+References: <bc35a1559ba18018db00e017ef9359f091274151.1728389216.git.mykyta_poturai@epam.com>
+From: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Date: Mon, 26 Feb 2018 21:24:38 +0200
+Subject: [PATCH 09/22] Modify pvz protocol to support Grant Tables based
+ mechanism
+
+Extend protocol to support Grant Tables based mechanism for mapping
+Guest FW heap. The main idea of such mapping is to allow all heaps
+to get into the host domain's P2M table (and as the result into
+the IOMMU page table) automatically.
+
+Signed-off-by: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Reviewed-by: Oleksandr Andrushchenko <oleksandr_andrushchenko@epam.com>
+---
+ services/system/rogue/common/env/xen/pvzif.h | 14 +++++++++++++-
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/services/system/rogue/common/env/xen/pvzif.h b/services/system/rogue/common/env/xen/pvzif.h
+index dd5e589..076de2e 100644
+--- a/services/system/rogue/common/env/xen/pvzif.h
++++ b/services/system/rogue/common/env/xen/pvzif.h
+@@ -21,7 +21,7 @@
+  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+  * DEALINGS IN THE SOFTWARE.
+  *
+- * Copyright (C) 2017 EPAM Systems Inc.
++ * Copyright (C) 2017-2018 EPAM Systems Inc.
+  *
+  * Authors: Oleksandr Andrushchenko <oleksandr_andrushchenko@epam.com>
+  */
+@@ -85,12 +85,24 @@
+ #define XENGSX_FIELD_EVT_CHNL		"event-channel"
+ #define XENGSX_FIELD_OSID		"osid"
+ 
++#if defined(PVRSRV_PVZIF_GNTTAB)
++struct xengsx_page_directory {
++	grant_ref_t gref_dir_next_page;
++	grant_ref_t gref[1]; /* Variable length */
++};
++#endif
++
+ /*
+  * Map Guest FW heap
+  */
+ struct xengsx_map_dev_heap_req {
++#if defined(PVRSRV_PVZIF_GNTTAB)
++	/* page directory contains grefs of the Guest FW heap */
++	grant_ref_t gref_directory;
++#else
+ 	/* IPA address of the Guest FW heap start */
+ 	uint64_t ipa;
++#endif
+ 	/* size of the heap, bytes */
+ 	uint64_t buffer_sz;
+ };
+-- 
+2.34.1
+

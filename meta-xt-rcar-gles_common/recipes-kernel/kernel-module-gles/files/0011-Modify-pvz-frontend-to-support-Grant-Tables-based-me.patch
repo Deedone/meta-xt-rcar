@@ -1,0 +1,124 @@
+From 7bb67d853d68b3bd4be8d9037f36ff7fa43529c3 Mon Sep 17 00:00:00 2001
+Message-Id: <7bb67d853d68b3bd4be8d9037f36ff7fa43529c3.1728389216.git.mykyta_poturai@epam.com>
+In-Reply-To: <bc35a1559ba18018db00e017ef9359f091274151.1728389216.git.mykyta_poturai@epam.com>
+References: <bc35a1559ba18018db00e017ef9359f091274151.1728389216.git.mykyta_poturai@epam.com>
+From: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Date: Tue, 27 Feb 2018 13:56:00 +0200
+Subject: [PATCH 11/22] Modify pvz frontend to support Grant Tables based
+ mechanism
+
+This patch adds support for sharing Guest FW heap with the backend
+using grefs.
+
+Signed-off-by: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+---
+ .../system/rogue/common/env/xen/xen_front.c   | 60 +++++++++++++++++--
+ 1 file changed, 55 insertions(+), 5 deletions(-)
+
+diff --git a/services/system/rogue/common/env/xen/xen_front.c b/services/system/rogue/common/env/xen/xen_front.c
+index 22d9e95..9d9d282 100644
+--- a/services/system/rogue/common/env/xen/xen_front.c
++++ b/services/system/rogue/common/env/xen/xen_front.c
+@@ -25,6 +25,10 @@
+ #include "xen_front.h"
+ #include "xen_debug.h"
+ 
++#if defined(PVRSRV_PVZIF_GNTTAB)
++#include "xen_pvz_front_shbuf.h"
++#endif
++
+ /* timeout in ms to wait for backend to respond */
+ #define VGSX_WAIT_BACK_MS	3000
+ 
+@@ -60,6 +64,9 @@ struct xdrv_info {
+ 	 * For that reason we will block on pvz_completion until this is done
+ 	 */
+ 	struct completion pvz_completion;
++#if defined(PVRSRV_PVZIF_GNTTAB)
++	struct xen_pvz_front_shbuf *shbuf;
++#endif
+ };
+ 
+ struct xdrv_info xen_front_drv_info;
+@@ -461,21 +468,53 @@ int gsx_front_map(uint32_t func_id, uint32_t dev_id,
+ 	struct xengsx_req *req;
+ 	unsigned long flags;
+ 	int ret;
++#if defined(PVRSRV_PVZIF_GNTTAB)
++	struct xen_pvz_front_shbuf_cfg buf_cfg;
++
++	memset(&buf_cfg, 0, sizeof(buf_cfg));
++	buf_cfg.xb_dev = drv_info->xb_dev;
++	buf_cfg.size = size;
++	buf_cfg.addr = addr;
++	buf_cfg.pages = NULL;
++
++	drv_info->shbuf = xen_pvz_front_shbuf_alloc(&buf_cfg);
++	if (!drv_info->shbuf)
++		return -ENOMEM;
++#endif
+ 
+ 	spin_lock_irqsave(&drv_info->io_lock, flags);
+ 	req = be_prepare_req(drv_info, XENGSX_OP_MAP_DEV_HEAP);
+ 	req->func_id = func_id;
+ 	req->dev_id = dev_id;
++#if defined(PVRSRV_PVZIF_GNTTAB)
++	req->op.map_dev_heap.gref_directory =
++			xen_pvz_front_shbuf_get_dir_start(drv_info->shbuf);
++#else
+ 	req->op.map_dev_heap.ipa = addr;
++#endif
+ 	req->op.map_dev_heap.buffer_sz = size;
+ 
+ 	ret = be_do_io(&drv_info->evt_chnl);
+ 	spin_unlock_irqrestore(&drv_info->io_lock, flags);
+ 
+ 	if (ret < 0)
+-		return ret;
++		goto fail;
++
++	ret = be_wait_io(&drv_info->evt_chnl);
++	if (ret)
++		goto fail;
++
++	return 0;
++
++fail:
++#if defined(PVRSRV_PVZIF_GNTTAB)
++	if (drv_info->shbuf) {
++		xen_pvz_front_shbuf_free(drv_info->shbuf);
++		drv_info->shbuf = NULL;
++	}
++#endif
+ 
+-	return be_wait_io(&drv_info->evt_chnl);
++	return ret;
+ }
+ 
+ int gsx_front_unmap(uint32_t func_id, uint32_t dev_id)
+@@ -493,8 +532,19 @@ int gsx_front_unmap(uint32_t func_id, uint32_t dev_id)
+ 	ret = be_do_io(&drv_info->evt_chnl);
+ 	spin_unlock_irqrestore(&drv_info->io_lock, flags);
+ 
+-	if (ret < 0)
+-		return ret;
++	if (!ret)
++		ret = be_wait_io(&drv_info->evt_chnl);
+ 
+-	return be_wait_io(&drv_info->evt_chnl);
++#if defined(PVRSRV_PVZIF_GNTTAB)
++	/*
++	 * do this regardless of communication status with the backend:
++	 * if we cannot remove remote resources remove what we can locally
++	 */
++	if (drv_info->shbuf) {
++		xen_pvz_front_shbuf_free(drv_info->shbuf);
++		drv_info->shbuf = NULL;
++	}
++#endif
++
++	return ret;
+ }
+-- 
+2.34.1
+

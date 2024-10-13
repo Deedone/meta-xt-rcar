@@ -1,0 +1,67 @@
+From 78ff81b6aef36ff02e9b04d623828d1b5eef2b62 Mon Sep 17 00:00:00 2001
+Message-Id: <78ff81b6aef36ff02e9b04d623828d1b5eef2b62.1728389216.git.mykyta_poturai@epam.com>
+In-Reply-To: <bc35a1559ba18018db00e017ef9359f091274151.1728389216.git.mykyta_poturai@epam.com>
+References: <bc35a1559ba18018db00e017ef9359f091274151.1728389216.git.mykyta_poturai@epam.com>
+From: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Date: Fri, 15 Feb 2019 14:30:22 +0200
+Subject: [PATCH 15/22] xen_front: Track phys heap mapping
+
+Ask backend to unmap phys heap only if the one was previously mapped.
+
+This allows us to avoid the following errors that we face when trying
+to unmap phys heap which has never been mapped.
+
+backend side:
+vgsx:(xdrv_do_op:436): Wrong device ID while unmapping: provided 0 expected -1, OSID 1 domain ID 2
+
+frontend side:
+PVR_K:(Error):  2081: PvzClientMapDevPhysHeap() failed (Unknown PVRSRV error number) in SysVzUnregisterFwPhysHeap()
+
+Signed-off-by: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+---
+ services/system/rogue/common/env/xen/xen_front.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/services/system/rogue/common/env/xen/xen_front.c b/services/system/rogue/common/env/xen/xen_front.c
+index 60f4fec..0512c61 100644
+--- a/services/system/rogue/common/env/xen/xen_front.c
++++ b/services/system/rogue/common/env/xen/xen_front.c
+@@ -67,6 +67,8 @@ struct xdrv_info {
+ #if defined(PVRSRV_PVZIF_GNTTAB)
+ 	struct xen_pvz_front_shbuf *shbuf;
+ #endif
++	/* To show whether the phys heap is mapped */
++	bool mapped;
+ };
+ 
+ struct xdrv_info xen_front_drv_info;
+@@ -503,6 +505,8 @@ int gsx_front_map(uint32_t func_id, uint32_t dev_id,
+ 	if (ret)
+ 		goto fail;
+ 
++	drv_info->mapped = true;
++
+ 	return 0;
+ 
+ fail:
+@@ -523,6 +527,9 @@ int gsx_front_unmap(uint32_t func_id, uint32_t dev_id)
+ 	unsigned long flags;
+ 	int ret;
+ 
++	if (!drv_info->mapped)
++		return 0;
++
+ 	spin_lock_irqsave(&drv_info->io_lock, flags);
+ 	req = be_prepare_req(drv_info, XENGSX_OP_UNMAP_DEV_HEAP);
+ 	req->func_id = func_id;
+@@ -545,5 +552,7 @@ int gsx_front_unmap(uint32_t func_id, uint32_t dev_id)
+ 	}
+ #endif
+ 
++	drv_info->mapped = false;
++
+ 	return ret;
+ }
+-- 
+2.34.1
+

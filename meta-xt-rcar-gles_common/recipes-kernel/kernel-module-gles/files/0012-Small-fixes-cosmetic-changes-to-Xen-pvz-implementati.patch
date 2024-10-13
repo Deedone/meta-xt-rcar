@@ -1,0 +1,187 @@
+From 03afa269797d62de024d7dcf923f0721b9ea8aa8 Mon Sep 17 00:00:00 2001
+Message-Id: <03afa269797d62de024d7dcf923f0721b9ea8aa8.1728389216.git.mykyta_poturai@epam.com>
+In-Reply-To: <bc35a1559ba18018db00e017ef9359f091274151.1728389216.git.mykyta_poturai@epam.com>
+References: <bc35a1559ba18018db00e017ef9359f091274151.1728389216.git.mykyta_poturai@epam.com>
+From: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Date: Wed, 28 Mar 2018 13:25:59 +0300
+Subject: [PATCH 12/22] Small fixes/cosmetic changes to Xen pvz implementation
+
+Mostly about dropping "inline" attribute and changing
+*mb() -> virt_*mb().
+
+Signed-off-by: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+---
+ .../system/rogue/common/env/xen/xen_back.c    | 15 ++++++-----
+ .../system/rogue/common/env/xen/xen_front.c   | 25 +++++++++----------
+ 2 files changed, 21 insertions(+), 19 deletions(-)
+
+diff --git a/services/system/rogue/common/env/xen/xen_back.c b/services/system/rogue/common/env/xen/xen_back.c
+index a783c1c..7613273 100644
+--- a/services/system/rogue/common/env/xen/xen_back.c
++++ b/services/system/rogue/common/env/xen/xen_back.c
+@@ -109,7 +109,7 @@ static struct xengsx_resp *be_prepare_resp(struct xdrv_info *xdrv_info,
+ 	return resp;
+ }
+ 
+-static inline void xdrv_evtchnl_flush(
++static void xdrv_evtchnl_flush(
+ 		struct xdrv_evtchnl_info *channel)
+ {
+ 	int notify;
+@@ -382,7 +382,7 @@ static void xdrv_do_op(struct work_struct *data)
+ 
+ 		rc = evt_chnl->ring.req_cons;
+ 		rp = evt_chnl->ring.sring->req_prod;
+-		rmb(); /* Ensure we see queued requests up to 'rp'. */
++		virt_rmb(); /* Ensure we see queued requests up to 'rp'. */
+ 
+ 		while (rc != rp) {
+ 
+@@ -468,7 +468,7 @@ static irqreturn_t xdrv_gsxif_fe_int(int irq, void *dev_id)
+ 	return IRQ_HANDLED;
+ }
+ 
+-static inline int xdrv_fe_on_initialized(struct xdrv_info *drv_info)
++static int xdrv_fe_on_initialized(struct xdrv_info *drv_info)
+ {
+ 	struct xenbus_device *xb_dev = drv_info->xb_dev;
+ 	struct xdrv_evtchnl_info *evt_chnl = &drv_info->evt_chnl;
+@@ -546,7 +546,7 @@ fail:
+ 	return ret;
+ }
+ 
+-static inline void xdrv_fe_on_disconnected(struct xdrv_info *drv_info)
++static void xdrv_fe_on_disconnected(struct xdrv_info *drv_info)
+ {
+ 	struct xdrv_evtchnl_info *evt_chnl = &drv_info->evt_chnl;
+ 
+@@ -578,7 +578,7 @@ static inline void xdrv_fe_on_disconnected(struct xdrv_info *drv_info)
+ 	drv_info->osid = 0;
+ }
+ 
+-static inline void xdrv_fe_close(struct xdrv_info *drv_info)
++static void xdrv_fe_close(struct xdrv_info *drv_info)
+ {
+ 	struct xenbus_device *xb_dev = drv_info->xb_dev;
+ 
+@@ -626,8 +626,11 @@ static void xdrv_fe_on_changed(struct xenbus_device *xb_dev,
+ 			break;
+ 
+ 		ret = xdrv_fe_on_initialized(drv_info);
+-		if (ret < 0)
++		if (ret < 0) {
++			xenbus_dev_fatal(xb_dev, ret,
++				"initializing " XENGSX_DRIVER_NAME);
+ 			break;
++		}
+ 
+ 		xenbus_switch_state(xb_dev, XenbusStateConnected);
+ 		break;
+diff --git a/services/system/rogue/common/env/xen/xen_front.c b/services/system/rogue/common/env/xen/xen_front.c
+index 9d9d282..60f4fec 100644
+--- a/services/system/rogue/common/env/xen/xen_front.c
++++ b/services/system/rogue/common/env/xen/xen_front.c
+@@ -40,7 +40,7 @@ enum xdrv_evtchnl_state {
+ struct xdrv_evtchnl_info {
+ 	struct xdrv_info *drv_info;
+ 	struct xen_gsxif_front_ring ring;
+-	int ring_ref;
++	grant_ref_t ring_ref;
+ 	int port;
+ 	int irq;
+ 	struct completion completion;
+@@ -76,7 +76,7 @@ static inline struct xdrv_info *xdrv_get_drv_info(void)
+ 	return &xen_front_drv_info;
+ }
+ 
+-static inline void xdrv_evtchnl_flush(struct xdrv_evtchnl_info *channel);
++static void xdrv_evtchnl_flush(struct xdrv_evtchnl_info *channel);
+ 
+ static struct xengsx_req *be_prepare_req(struct xdrv_info *xdrv_info,
+ 	uint8_t operation)
+@@ -93,15 +93,15 @@ static struct xengsx_req *be_prepare_req(struct xdrv_info *xdrv_info,
+ 
+ static int be_do_io(struct xdrv_evtchnl_info *evtchnl)
+ {
++	reinit_completion(&evtchnl->completion);
+ 	if (unlikely(evtchnl->state != EVTCHNL_STATE_CONNECTED))
+ 		return -EIO;
+ 
+-	reinit_completion(&evtchnl->completion);
+ 	xdrv_evtchnl_flush(evtchnl);
+ 	return 0;
+ }
+ 
+-static inline int be_wait_io(struct xdrv_evtchnl_info *evtchnl)
++static int be_wait_io(struct xdrv_evtchnl_info *evtchnl)
+ {
+ 	if (wait_for_completion_timeout(
+ 			&evtchnl->completion,
+@@ -118,14 +118,15 @@ static irqreturn_t xdrv_evtchnl_interrupt(int irq, void *dev_id)
+ 	RING_IDX i, rp;
+ 	unsigned long flags;
+ 
+-	spin_lock_irqsave(&drv_info->io_lock, flags);
+ 	if (unlikely(channel->state != EVTCHNL_STATE_CONNECTED))
+-		goto out;
++		return IRQ_HANDLED;
++
++	spin_lock_irqsave(&drv_info->io_lock, flags);
+ 
+ again:
+ 	rp = channel->ring.sring->rsp_prod;
+ 	/* ensure we see queued responses up to rp */
+-	rmb();
++	virt_rmb();
+ 
+ 	for (i = channel->ring.rsp_cons; i != rp; i++) {
+ 		resp = RING_GET_RESPONSE(&channel->ring, i);
+@@ -157,12 +158,11 @@ again:
+ 	} else
+ 		channel->ring.sring->rsp_event = i + 1;
+ 
+-out:
+ 	spin_unlock_irqrestore(&drv_info->io_lock, flags);
+ 	return IRQ_HANDLED;
+ }
+ 
+-static inline void xdrv_evtchnl_flush(
++static void xdrv_evtchnl_flush(
+ 		struct xdrv_evtchnl_info *channel)
+ {
+ 	int notify;
+@@ -279,12 +279,12 @@ static int xdrv_evtchnl_create(struct xdrv_info *drv_info)
+ 	return 0;
+ }
+ 
+-static inline int xdrv_be_on_initwait(struct xdrv_info *drv_info)
++static int xdrv_be_on_initwait(struct xdrv_info *drv_info)
+ {
+ 	return xdrv_evtchnl_create(drv_info);
+ }
+ 
+-static inline int xdrv_be_on_connected(struct xdrv_info *drv_info)
++static int xdrv_be_on_connected(struct xdrv_info *drv_info)
+ {
+ 	unsigned long flags;
+ 
+@@ -294,7 +294,7 @@ static inline int xdrv_be_on_connected(struct xdrv_info *drv_info)
+ 	return 0;
+ }
+ 
+-static inline void xdrv_be_on_disconnected(struct xdrv_info *drv_info)
++static void xdrv_be_on_disconnected(struct xdrv_info *drv_info)
+ {
+ 	xdrv_evtchnl_free(drv_info);
+ 	xenbus_switch_state(drv_info->xb_dev, XenbusStateInitialising);
+@@ -366,7 +366,6 @@ static void xdrv_be_on_changed(struct xenbus_device *xb_dev,
+ 			break;
+ 
+ 		xdrv_be_on_disconnected(drv_info);
+-		xenbus_switch_state(xb_dev, XenbusStateInitialising);
+ 		break;
+ 	}
+ }
+-- 
+2.34.1
+

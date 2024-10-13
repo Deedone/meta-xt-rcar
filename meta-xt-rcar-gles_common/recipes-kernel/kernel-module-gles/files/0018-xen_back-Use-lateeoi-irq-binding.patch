@@ -1,0 +1,95 @@
+From a1795e07ac44023522aab6c5d586d2336c9685a3 Mon Sep 17 00:00:00 2001
+Message-Id: <a1795e07ac44023522aab6c5d586d2336c9685a3.1728389216.git.mykyta_poturai@epam.com>
+In-Reply-To: <bc35a1559ba18018db00e017ef9359f091274151.1728389216.git.mykyta_poturai@epam.com>
+References: <bc35a1559ba18018db00e017ef9359f091274151.1728389216.git.mykyta_poturai@epam.com>
+From: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Date: Thu, 10 Jun 2021 23:58:41 +0300
+Subject: [PATCH 18/22] xen_back: Use lateeoi irq binding
+
+In order to reduce the chance for the system becoming unresponsive due
+to event storms triggered by a misbehaving frontend use the lateeoi
+irq binding for backend and unmask the event channel only just before
+leaving the event handling function.
+
+When no request has been consumed set the spurious flag when sending
+the EOI for an interrupt.
+
+In case of a ring protocol error don't issue an EOI at all in order
+to avoid the possibility to use that for producing an event storm.
+
+[Based on corresponding patches for in-tree Xen PV backends]
+
+Signed-off-by: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+---
+ .../system/rogue/common/env/xen/xen_back.c    | 23 ++++++++++++++++++-
+ 1 file changed, 22 insertions(+), 1 deletion(-)
+
+diff --git a/services/system/rogue/common/env/xen/xen_back.c b/services/system/rogue/common/env/xen/xen_back.c
+index f3f61c9..26304ca 100644
+--- a/services/system/rogue/common/env/xen/xen_back.c
++++ b/services/system/rogue/common/env/xen/xen_back.c
+@@ -375,6 +375,7 @@ static void xdrv_do_op(struct work_struct *data)
+ 	struct xengsx_resp *resp;
+ 	int more_to_do, ret;
+ 	IMG_UINT64 ui64PAddr = -1ULL;
++	unsigned int eoi_flags = XEN_EOI_FLAG_SPURIOUS;
+ 
+ 	do {
+ 		struct xengsx_req req;
+@@ -384,11 +385,21 @@ static void xdrv_do_op(struct work_struct *data)
+ 		rp = evt_chnl->ring.sring->req_prod;
+ 		virt_rmb(); /* Ensure we see queued requests up to 'rp'. */
+ 
++		if (RING_REQUEST_PROD_OVERFLOW(&evt_chnl->ring, rp)) {
++			rc = evt_chnl->ring.rsp_prod_pvt;
++			XEN_ERROR("Frontend provided bogus ring requests (%d - %d = %d). Halting ring processing",
++				rp, rc, rp - rc);
++			return;
++		}
++
+ 		while (rc != rp) {
+ 
+ 			if (RING_REQUEST_CONS_OVERFLOW(&evt_chnl->ring, rc))
+ 				break;
+ 
++			/* We've seen a request, so clear spurious eoi flag. */
++			eoi_flags &= ~XEN_EOI_FLAG_SPURIOUS;
++
+ 			memcpy(&req, RING_GET_REQUEST(&evt_chnl->ring, rc), sizeof(req));
+ 			evt_chnl->ring.req_cons = ++rc; /* before make_response() */
+ 
+@@ -458,12 +469,22 @@ static void xdrv_do_op(struct work_struct *data)
+ 		}
+ 		RING_FINAL_CHECK_FOR_REQUESTS(&evt_chnl->ring, more_to_do);
+ 	} while (more_to_do);
++
++	/*
++	 * Enable IRQ to receive another frontend request just before
++	 * leaving the worker.
++	 */
++	xen_irq_lateeoi(evt_chnl->irq, eoi_flags);
+ }
+ 
+ static irqreturn_t xdrv_gsxif_fe_int(int irq, void *dev_id)
+ {
+ 	struct xdrv_info *drv_info = (struct xdrv_info *)dev_id;
+ 
++	/* IRQs might come in before evt_chnl.irq is written. */
++	if (unlikely(drv_info->evt_chnl.irq != irq))
++		drv_info->evt_chnl.irq = irq;
++
+ 	schedule_work(&drv_info->op_work);
+ 	return IRQ_HANDLED;
+ }
+@@ -527,7 +548,7 @@ static int xdrv_fe_on_initialized(struct xdrv_info *drv_info)
+ 
+ 	evt_chnl->sring = vaddr;
+ 
+-	ret = bind_interdomain_evtchn_to_irqhandler(xb_dev->otherend_id, port,
++	ret = bind_interdomain_evtchn_to_irqhandler_lateeoi(xb_dev->otherend_id, port,
+ 		xdrv_gsxif_fe_int, 0, XENGSX_DRIVER_NAME "-backend", drv_info);
+ 	if (ret < 0) {
+ 		xenbus_dev_fatal(xb_dev, ret, "binding IRQ");
+-- 
+2.34.1
+

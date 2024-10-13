@@ -1,0 +1,417 @@
+From 60be3ed528cb754388caf638bc27f7e6328f9f89 Mon Sep 17 00:00:00 2001
+Message-Id: <60be3ed528cb754388caf638bc27f7e6328f9f89.1728389216.git.mykyta_poturai@epam.com>
+In-Reply-To: <bc35a1559ba18018db00e017ef9359f091274151.1728389216.git.mykyta_poturai@epam.com>
+References: <bc35a1559ba18018db00e017ef9359f091274151.1728389216.git.mykyta_poturai@epam.com>
+From: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Date: Mon, 26 Feb 2018 21:14:37 +0200
+Subject: [PATCH 10/22] Modify pvz backend to support Grant Tables based
+ mechanism
+
+This patch adds support for mapping Guest FW heap using grefs provided
+by frontend.
+
+Signed-off-by: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+---
+ .../system/rogue/common/env/xen/xen_back.c    | 322 +++++++++++++++++-
+ 1 file changed, 315 insertions(+), 7 deletions(-)
+
+diff --git a/services/system/rogue/common/env/xen/xen_back.c b/services/system/rogue/common/env/xen/xen_back.c
+index 045c9fd..a783c1c 100644
+--- a/services/system/rogue/common/env/xen/xen_back.c
++++ b/services/system/rogue/common/env/xen/xen_back.c
+@@ -27,6 +27,11 @@
+ #include "xen_back.h"
+ #include "xen_debug.h"
+ 
++#if defined(PVRSRV_PVZIF_GNTTAB)
++#include <linux/of_device.h>
++#include "xen_pvz_balloon.h"
++#endif
++
+ #define VGSX_BAD_DEVICE_ID	-1
+ 
+ struct xdrv_evtchnl_info {
+@@ -36,6 +41,17 @@ struct xdrv_evtchnl_info {
+ 	int irq;
+ };
+ 
++#if defined(PVRSRV_PVZIF_GNTTAB)
++struct dev_heap_object {
++	struct xen_pvz_balloon balloon;
++	grant_handle_t *map_handles;
++
++	/* these are pages from Xen balloon for allocated Guest FW heap */
++	uint32_t num_pages;
++	struct page **pages;
++};
++#endif
++
+ struct xdrv_info {
+ 	struct xenbus_device *xb_dev;
+ 	struct xdrv_evtchnl_info evt_chnl;
+@@ -43,6 +59,9 @@ struct xdrv_info {
+ 	uint32_t osid;
+ 	/* guest FW heap device ID - used to unmap if domain crashes */
+ 	uint32_t dev_id;
++#if defined(PVRSRV_PVZIF_GNTTAB)
++	struct dev_heap_object *heap_obj;
++#endif
+ };
+ 
+ static VMM_PVZ_CONNECTION *xen_back_pvz_connection;
+@@ -101,6 +120,253 @@ static inline void xdrv_evtchnl_flush(
+ 		notify_remote_via_irq(channel->irq);
+ }
+ 
++#if defined(PVRSRV_PVZIF_GNTTAB)
++/*
++ * number of grefs a page can hold with respect to the
++ * struct xengsx_page_directory header
++ */
++#define XEN_GSX_NUM_GREFS_PER_PAGE ((PAGE_SIZE - \
++	offsetof(struct xengsx_page_directory, gref)) / \
++	sizeof(grant_ref_t))
++
++#define xen_page_to_vaddr(page) \
++		((phys_addr_t)pfn_to_kaddr(page_to_xen_pfn(page)))
++
++static int __xdrv_map_dev_heap(struct xdrv_info *drv_info,
++		uint32_t num_grefs, grant_ref_t *grefs)
++{
++	struct dev_heap_object *heap_obj;
++	struct gnttab_map_grant_ref *map_ops = NULL;
++	int i, ret;
++
++	if (!num_grefs || !grefs)
++		return -EINVAL;
++
++	heap_obj = kzalloc(sizeof(*heap_obj), GFP_KERNEL);
++	if (!heap_obj)
++		return -ENOMEM;
++
++	heap_obj->num_pages = num_grefs;
++	heap_obj->pages = kcalloc(heap_obj->num_pages, sizeof(*heap_obj->pages),
++			GFP_KERNEL);
++	if (!heap_obj->pages) {
++		ret = -ENOMEM;
++		goto fail;
++	}
++
++	heap_obj->map_handles = kcalloc(heap_obj->num_pages,
++			sizeof(*heap_obj->map_handles), GFP_KERNEL);
++	if (!heap_obj->map_handles) {
++		ret = -ENOMEM;
++		goto fail;
++	}
++
++	map_ops = kcalloc(heap_obj->num_pages, sizeof(*map_ops), GFP_KERNEL);
++	if (!map_ops) {
++		ret = -ENOMEM;
++		goto fail;
++	}
++
++	ret = xen_pvz_ballooned_pages_alloc(&drv_info->xb_dev->dev,
++			&heap_obj->balloon, heap_obj->num_pages, heap_obj->pages);
++	if (ret < 0) {
++		XEN_ERROR("Failed to allocate %d ballooned pages: %d\n",
++				heap_obj->num_pages, ret);
++		goto fail;
++	}
++
++	XEN_DEBUG("Mapping %d pages\n", heap_obj->num_pages);
++
++	for (i = 0; i < heap_obj->num_pages; i++) {
++		phys_addr_t addr = xen_page_to_vaddr(heap_obj->pages[i]);
++
++		gnttab_set_map_op(&map_ops[i], addr, GNTMAP_host_map, grefs[i],
++				drv_info->xb_dev->otherend_id);
++	}
++
++	ret = gnttab_map_refs(map_ops, NULL, heap_obj->pages, heap_obj->num_pages);
++	BUG_ON(ret);
++
++	for (i = 0; i < heap_obj->num_pages; i++) {
++		heap_obj->map_handles[i] = map_ops[i].handle;
++		if (unlikely(map_ops[i].status != GNTST_okay))
++			XEN_ERROR("Failed to map page %d with ref %d: %d\n",
++					i, grefs[i], map_ops[i].status);
++	}
++
++	kfree(map_ops);
++	drv_info->heap_obj = heap_obj;
++
++	return ret;
++
++fail:
++	if (map_ops)
++		kfree(map_ops);
++	if (heap_obj->map_handles)
++		kfree(heap_obj->map_handles);
++	if (heap_obj->pages)
++		kfree(heap_obj->pages);
++	kfree(heap_obj);
++
++	return ret;
++}
++
++static int xdrv_map_dev_heap(struct xdrv_info *drv_info,
++		grant_ref_t gref_directory, uint64_t buffer_sz)
++{
++	struct gnttab_map_grant_ref *map_ops = NULL;
++	struct gnttab_unmap_grant_ref *unmap_ops = NULL;
++	struct xengsx_page_directory *page_dir;
++	struct page *page = NULL;
++	uint32_t num_grefs;
++	grant_ref_t *grefs;
++	phys_addr_t addr;
++	int i, ret, num_pages_dir, grefs_left;
++
++	if (drv_info->heap_obj)
++		return -EINVAL;
++
++	if (gref_directory == GRANT_INVALID_REF || buffer_sz == 0)
++		return -EINVAL;
++
++	num_grefs = DIV_ROUND_UP(buffer_sz, PAGE_SIZE);
++	num_pages_dir = DIV_ROUND_UP(num_grefs, XEN_GSX_NUM_GREFS_PER_PAGE);
++
++	grefs = kcalloc(num_grefs, sizeof(grant_ref_t), GFP_KERNEL);
++	if (!grefs)
++		return -ENOMEM;
++
++	map_ops = kzalloc(sizeof(*map_ops), GFP_KERNEL);
++	if (!map_ops) {
++		ret = -ENOMEM;
++		goto out;
++	}
++
++	unmap_ops = kzalloc(sizeof(*unmap_ops), GFP_KERNEL);
++	if (!unmap_ops) {
++		ret = -ENOMEM;
++		goto out;
++	}
++
++	ret = gnttab_alloc_pages(1, &page);
++	if (ret)
++		goto out;
++
++	addr = xen_page_to_vaddr(page);
++	page_dir = (struct xengsx_page_directory *)addr;
++	grefs_left = num_grefs;
++
++	XEN_DEBUG("Mapping %d page directories\n", num_pages_dir);
++
++	for (i = 0; i < num_pages_dir; i++) {
++		int to_copy = XEN_GSX_NUM_GREFS_PER_PAGE;
++
++		if (unlikely(gref_directory == GRANT_INVALID_REF)) {
++			ret = -EINVAL;
++			XEN_ERROR("Got invalid ref for page directory %d\n", i);
++			goto out;
++		}
++
++		gnttab_set_map_op(map_ops, addr, GNTMAP_host_map, gref_directory,
++				drv_info->xb_dev->otherend_id);
++
++		ret = gnttab_map_refs(map_ops, NULL, &page, 1);
++		BUG_ON(ret);
++
++		if (unlikely(map_ops->status != GNTST_okay))
++			XEN_ERROR("Failed to map page directory %d with ref %d: %d\n",
++				i, gref_directory, map_ops->status);
++
++		if (to_copy > grefs_left)
++			to_copy = grefs_left;
++
++		memcpy(&grefs[XEN_GSX_NUM_GREFS_PER_PAGE * i], page_dir->gref,
++				to_copy * sizeof(grant_ref_t));
++
++		gref_directory = page_dir->gref_dir_next_page;
++		grefs_left -= to_copy;
++
++		gnttab_set_unmap_op(unmap_ops, addr, GNTMAP_host_map, map_ops->handle);
++
++		ret = gnttab_unmap_refs(unmap_ops, NULL, &page, 1);
++		BUG_ON(ret);
++
++		if (unlikely(unmap_ops->status != GNTST_okay))
++				XEN_ERROR("Failed to unmap page directory %d: %d\n",
++						i, unmap_ops->status);
++	}
++
++	ret = __xdrv_map_dev_heap(drv_info, num_grefs, grefs);
++	if (ret < 0)
++		XEN_ERROR("Failed to map %d pages: %d\n", num_grefs, ret);
++
++out:
++	if (page)
++		gnttab_free_pages(1, &page);
++	if (unmap_ops)
++		kfree(unmap_ops);
++	if (map_ops)
++		kfree(map_ops);
++	kfree(grefs);
++
++	return ret;
++}
++
++static int xdrv_unmap_dev_heap(struct xdrv_info *drv_info)
++{
++	struct dev_heap_object *heap_obj = drv_info->heap_obj;
++	struct gnttab_unmap_grant_ref *unmap_ops;
++	int i, ret;
++
++	if (!heap_obj)
++		return 0;
++
++	unmap_ops = kcalloc(heap_obj->num_pages, sizeof(*unmap_ops), GFP_KERNEL);
++	if (!unmap_ops)
++		return -ENOMEM;
++
++	XEN_DEBUG("Unmapping %d pages\n", heap_obj->num_pages);
++
++	for (i = 0; i < heap_obj->num_pages; i++) {
++		phys_addr_t addr = xen_page_to_vaddr(heap_obj->pages[i]);
++
++		/*
++		 * Map the grant entry for access by host CPUs.
++		 * If <host_addr> or <dev_bus_addr> is zero, that
++		 * field is ignored. If non-zero, they must refer to
++		 * a device/host mapping that is tracked by <handle>
++		 */
++		gnttab_set_unmap_op(&unmap_ops[i], addr, GNTMAP_host_map,
++				heap_obj->map_handles[i]);
++		unmap_ops[i].dev_bus_addr =
++				__pfn_to_phys(__pfn_to_mfn(page_to_pfn(heap_obj->pages[i])));
++	}
++
++	ret = gnttab_unmap_refs(unmap_ops, NULL, heap_obj->pages,
++			heap_obj->num_pages);
++	BUG_ON(ret);
++
++	for (i = 0; i < heap_obj->num_pages; i++) {
++		if (unlikely(unmap_ops[i].status != GNTST_okay))
++			XEN_ERROR("Failed to unmap page %d: %d\n", i, unmap_ops[i].status);
++	}
++
++	kfree(unmap_ops);
++
++	xen_pvz_ballooned_pages_free(&drv_info->xb_dev->dev, &heap_obj->balloon,
++			heap_obj->num_pages, heap_obj->pages);
++
++	kfree(heap_obj->map_handles);
++	heap_obj->map_handles = NULL;
++	kfree(heap_obj->pages);
++	heap_obj->pages = NULL;
++	kfree(heap_obj);
++	drv_info->heap_obj = NULL;
++
++	return ret;
++}
++#endif
++
+ static void xdrv_do_op(struct work_struct *data)
+ {
+ 	struct xdrv_info *drv_info =
+@@ -108,6 +374,7 @@ static void xdrv_do_op(struct work_struct *data)
+ 	struct xdrv_evtchnl_info *evt_chnl = &drv_info->evt_chnl;
+ 	struct xengsx_resp *resp;
+ 	int more_to_do, ret;
++	IMG_UINT64 ui64PAddr = -1ULL;
+ 
+ 	do {
+ 		struct xengsx_req req;
+@@ -130,14 +397,30 @@ static void xdrv_do_op(struct work_struct *data)
+ 
+ 			switch (req.operation) {
+ 			case XENGSX_OP_MAP_DEV_HEAP:
+-				ret = xen_back_pvz_connection->sServerFuncTab.pfnMapDevPhysHeap(
+-					drv_info->osid, req.func_id, req.dev_id,
+-					req.op.map_dev_heap.buffer_sz,
+-					req.op.map_dev_heap.ipa);
+-				if (ret == PVRSRV_OK)
+-					drv_info->dev_id = req.dev_id;
++#if defined(PVRSRV_PVZIF_GNTTAB)
++				ret = xdrv_map_dev_heap(drv_info,
++					req.op.map_dev_heap.gref_directory,
++					req.op.map_dev_heap.buffer_sz);
++				if (!ret)
++					ui64PAddr = drv_info->heap_obj->balloon.dev_bus_addr;
++#else
++				ret = 0;
++				ui64PAddr = req.op.map_dev_heap.ipa;
++#endif
++				if (!ret) {
++					ret = xen_back_pvz_connection->sServerFuncTab.pfnMapDevPhysHeap(
++						drv_info->osid, req.func_id, req.dev_id,
++						req.op.map_dev_heap.buffer_sz,
++						ui64PAddr);
++					if (ret == PVRSRV_OK)
++						drv_info->dev_id = req.dev_id;
++#if defined(PVRSRV_PVZIF_GNTTAB)
++					else
++						xdrv_unmap_dev_heap(drv_info);
++#endif
++				}
+ 				XEN_DEBUG("Mapping Guest FW with OSID %d IPA 0x%llx sz %llu, ret %d",
+-					drv_info->osid, req.op.map_dev_heap.ipa,
++					drv_info->osid, ui64PAddr,
+ 					req.op.map_dev_heap.buffer_sz, ret);
+ 				resp = be_prepare_resp(drv_info, req.operation,
+ 					req.id);
+@@ -154,6 +437,12 @@ static void xdrv_do_op(struct work_struct *data)
+ 				} else {
+ 					ret = xen_back_pvz_connection->sServerFuncTab.pfnUnmapDevPhysHeap(
+ 						drv_info->osid, req.func_id, req.dev_id);
++#if defined(PVRSRV_PVZIF_GNTTAB)
++					if (xdrv_unmap_dev_heap(drv_info)) {
++						if (!ret)
++							ret = -1;
++					}
++#endif
+ 					drv_info->dev_id = VGSX_BAD_DEVICE_ID;
+ 					XEN_DEBUG("Unmapping Guest FW with OSID %d, ret %d",
+ 						drv_info->osid, ret);
+@@ -281,6 +570,9 @@ static inline void xdrv_fe_on_disconnected(struct xdrv_info *drv_info)
+ 	if (drv_info->osid) {
+ 		xen_back_pvz_connection->sVmmFuncTab.pfnOnVmOffline(
+ 			drv_info->osid);
++#if defined(PVRSRV_PVZIF_GNTTAB)
++		xdrv_unmap_dev_heap(drv_info);
++#endif
+ 		vgpu_img_reset_domid(drv_info->osid, 0);
+ 	}
+ 	drv_info->osid = 0;
+@@ -351,6 +643,7 @@ static int xdrv_probe(struct xenbus_device *xb_dev,
+ 	const struct xenbus_device_id *id)
+ {
+ 	struct xdrv_info *drv_info;
++	int ret;
+ 
+ 	drv_info = devm_kzalloc(&xb_dev->dev, sizeof(*drv_info), GFP_KERNEL);
+ 	if (!drv_info) {
+@@ -359,6 +652,21 @@ static int xdrv_probe(struct xenbus_device *xb_dev,
+ 	}
+ 
+ 	drv_info->xb_dev = xb_dev;
++#if defined(PVRSRV_PVZIF_GNTTAB)
++	/*
++	 * The device is not spawn from a device tree, so arch_setup_dma_ops
++	 * is not called, thus leaving the device with dummy DMA ops.
++	 * This makes the device return error on dma_alloc* allocations, which
++	 * is not correct: to fix this call of_dma_configure() with a NULL
++	 * node to set default DMA ops.
++	 */
++	xb_dev->dev.coherent_dma_mask = DMA_BIT_MASK(40);
++	ret = of_dma_configure(&xb_dev->dev, NULL, true);
++	if (ret < 0) {
++		xenbus_dev_fatal(xb_dev, ret, "setting up DMA ops");
++		return ret;
++	}
++#endif
+ 	drv_info->dev_id = VGSX_BAD_DEVICE_ID;
+ 	INIT_WORK(&drv_info->op_work, xdrv_do_op);
+ 	dev_set_drvdata(&xb_dev->dev, drv_info);
+-- 
+2.34.1
+
